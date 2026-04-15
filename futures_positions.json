@@ -1,0 +1,20 @@
+{
+  "ARIAUSDT": {
+    "symbol": "ARIAUSDT",
+    "direction": "SHORT",
+    "entry_price": "0.10659",
+    "quantity": "571",
+    "margin_used": "20.28763",
+    "leverage": 3,
+    "opened_at": "2026-04-15T13:41:04+00:00"
+  },
+  "RAVEUSDT": {
+    "symbol": "RAVEUSDT",
+    "direction": "SHORT",
+    "entry_price": "11.40571",
+    "quantity": "5",
+    "margin_used": "19.00951666666666666666666667",
+    "leverage": 3,
+    "opened_at": "2026-04-15T13:41:04+00:00"
+  }
+}
