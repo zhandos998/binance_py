@@ -74,6 +74,7 @@ class Config:
     kline_limit: int
     max_symbols: int
     symbol_selection: str
+    symbol_whitelist: tuple[str, ...]
     log_scanned_symbols: bool
     log_scan_summary: bool
     scan_summary_top_n: int
@@ -100,6 +101,7 @@ class Config:
     funding_filter_enabled: bool
     max_long_funding_rate_pct: float
     min_short_funding_rate_pct: float
+    max_entry_spread_pct: float
     trade_risk_pct: float
     max_open_positions: int
     max_trades_per_cycle: int
@@ -352,6 +354,11 @@ def load_config() -> Config:
         kline_limit=env_int("KLINE_LIMIT", 90, 50, 500),
         max_symbols=env_int("MAX_SYMBOLS", 0, 0, None),
         symbol_selection=symbol_selection,
+        symbol_whitelist=tuple(
+            item.strip().upper()
+            for item in os.getenv("SYMBOL_WHITELIST", "").split(",")
+            if item.strip()
+        ),
         log_scanned_symbols=env_bool("LOG_SCANNED_SYMBOLS", True),
         log_scan_summary=env_bool("LOG_SCAN_SUMMARY", True),
         scan_summary_top_n=env_int("SCAN_SUMMARY_TOP_N", 8, 1, 30),
@@ -378,6 +385,7 @@ def load_config() -> Config:
         funding_filter_enabled=env_bool("FUNDING_FILTER_ENABLED", False),
         max_long_funding_rate_pct=env_float("MAX_LONG_FUNDING_RATE_PCT", 0.03, 0.0, None),
         min_short_funding_rate_pct=env_float("MIN_SHORT_FUNDING_RATE_PCT", -0.03, None, 0.0),
+        max_entry_spread_pct=env_float("MAX_ENTRY_SPREAD_PCT", 0.0, 0.0, None),
         trade_risk_pct=env_float("TRADE_RISK_PCT", 1.0, 1.0, 5.0),
         max_open_positions=env_int("MAX_OPEN_POSITIONS", 5, 1, None),
         max_trades_per_cycle=env_int("MAX_TRADES_PER_CYCLE", 3, 1, None),

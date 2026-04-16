@@ -120,6 +120,7 @@ def get_usdt_futures_symbols(client: Client, config: Config) -> dict[str, Symbol
     symbols: dict[str, SymbolMeta] = {}
     rejection_counts: dict[str, int] = {}
     quote_volumes = get_futures_quote_volumes(client) if config.symbol_selection == "volume" else {}
+    whitelist = set(config.symbol_whitelist)
 
     for item in exchange_info.get("symbols", []):
         rejection_reason = futures_symbol_rejection_reason(item)
@@ -127,17 +128,24 @@ def get_usdt_futures_symbols(client: Client, config: Config) -> dict[str, Symbol
             rejection_counts[rejection_reason] = rejection_counts.get(rejection_reason, 0) + 1
             continue
 
+        symbol = str(item["symbol"]).upper()
+        if whitelist and symbol not in whitelist:
+            rejection_counts["не в SYMBOL_WHITELIST"] = rejection_counts.get("не в SYMBOL_WHITELIST", 0) + 1
+            continue
+
         filters = item.get("filters", [])
         min_qty, step_size = get_market_lot_values(filters)
         min_notional = get_min_notional(filters)
         tick_size = get_tick_size(filters)
         percent_price_up, percent_price_down = get_percent_price_values(filters)
-        symbol = item["symbol"]
         quote_volume = quote_volumes.get(symbol, Decimal("0"))
         selection_reason = (
             "активный USDT-M perpetual: status=TRADING, quoteAsset=USDT, "
             "marginAsset=USDT, contractType=PERPETUAL"
         )
+        if whitelist:
+            selection_reason += "; разрешен в SYMBOL_WHITELIST"
+
         symbols[symbol] = SymbolMeta(
             symbol=symbol,
             base_asset=item["baseAsset"],
@@ -176,6 +184,8 @@ def get_usdt_futures_symbols(client: Client, config: Config) -> dict[str, Symbol
             "status=TRADING, contractType=PERPETUAL, quoteAsset=USDT, marginAsset=USDT; "
             "исключены стейблкоины/фиат и UP/DOWN/BULL/BEAR токены.",
         )
+        if whitelist:
+            logging.info("Применен SYMBOL_WHITELIST: %s", ", ".join(config.symbol_whitelist))
         if config.symbol_selection == "volume":
             logging.info("Если MAX_SYMBOLS > 0, выбираются самые ликвидные по 24h quoteVolume.")
         log_symbol_chunks("Список символов для сканирования", list(ordered_symbols))
@@ -205,6 +215,15 @@ def get_entry_reference_prices(client: Client, symbol: str) -> tuple[Decimal, De
     return mark_price, bid_price, ask_price
 
 
+def spread_pct(bid_price: Decimal, ask_price: Decimal) -> Decimal:
+    if bid_price <= 0 or ask_price <= 0:
+        return Decimal("0")
+    mid_price = (bid_price + ask_price) / Decimal("2")
+    if mid_price <= 0:
+        return Decimal("0")
+    return ((ask_price - bid_price) / mid_price) * Decimal("100")
+
+
 def market_entry_passes_percent_filter(client: Client, config: Config, symbol_meta: SymbolMeta, side: str) -> bool:
     if not config.live_trading:
         return True
@@ -218,6 +237,19 @@ def market_entry_passes_percent_filter(client: Client, config: Config, symbol_me
     if mark_price <= 0 or bid_price <= 0 or ask_price <= 0:
         logging.info("%s: пропуск входа - некорректные bid/ask/mark цены.", symbol_meta.symbol)
         return False
+
+    if config.max_entry_spread_pct > 0:
+        current_spread_pct = spread_pct(bid_price, ask_price)
+        if current_spread_pct > Decimal(str(config.max_entry_spread_pct)):
+            logging.info(
+                "%s: пропуск входа - spread %.4f%% выше MAX_ENTRY_SPREAD_PCT=%.4f%% (bid=%s, ask=%s).",
+                symbol_meta.symbol,
+                current_spread_pct,
+                config.max_entry_spread_pct,
+                bid_price,
+                ask_price,
+            )
+            return False
 
     if side == SIDE_BUY:
         limit_price = mark_price * symbol_meta.percent_price_up

@@ -4,11 +4,12 @@ import unittest
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from bot_base import Position, RiskState
+from bot_base import RiskState
 from bot_risk import (
     apply_risk_state_on_close,
     calculate_order_size_for_balance,
     close_reason_kind,
+    normalize_risk_state,
     openings_blocked_reason,
 )
 from tests.support import make_config, make_symbol
@@ -41,6 +42,20 @@ class RiskTests(unittest.TestCase):
         self.assertIsNotNone(reason)
         assert reason is not None
         self.assertIn("MAX_CONSECUTIVE_LOSSES", reason)
+
+    def test_normalize_risk_state_resets_daily_pnl_and_loss_streak_on_new_day(self) -> None:
+        state = RiskState(
+            day="2026-04-15",
+            daily_realized_pnl=Decimal("-11.5"),
+            consecutive_losses=4,
+            cooldowns={},
+        )
+        changed = normalize_risk_state(state, datetime(2026, 4, 16, 1, 0, tzinfo=timezone.utc))
+
+        self.assertTrue(changed)
+        self.assertEqual(state.day, "2026-04-16")
+        self.assertEqual(state.daily_realized_pnl, Decimal("0"))
+        self.assertEqual(state.consecutive_losses, 0)
 
     def test_close_reason_kind_detects_take_profit(self) -> None:
         self.assertEqual(close_reason_kind("тейк-профит LONG: вход=1"), "TAKE_PROFIT")

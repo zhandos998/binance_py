@@ -89,6 +89,29 @@ MIN_SHORT_FUNDING_RATE_PCT=-0.03
 Значения здесь в процентах за funding-period.  
 Например `0.03` означает `0.03%`.
 
+### Spread filter
+
+Если `MAX_ENTRY_SPREAD_PCT > 0`, бот проверяет текущий spread по `bid/ask` перед market-входом.
+
+- если spread шире порога, вход пропускается;
+- это live-only фильтр, в backtest он не моделируется.
+
+Пример:
+
+```env
+MAX_ENTRY_SPREAD_PCT=0.10
+```
+
+### Universe whitelist
+
+Если задан `SYMBOL_WHITELIST`, бот сканирует только эти символы.
+
+Пример:
+
+```env
+SYMBOL_WHITELIST=BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT,DOGEUSDT
+```
+
 ## Риск
 
 Размер позиции ограничивается одновременно:

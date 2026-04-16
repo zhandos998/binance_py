@@ -25,6 +25,7 @@ def normalize_risk_state(state: RiskState, now: datetime | None = None) -> bool:
     if state.day != current_day:
         state.day = current_day
         state.daily_realized_pnl = Decimal("0")
+        state.consecutive_losses = 0
         changed = True
 
     active_cooldowns: dict[str, str] = {}

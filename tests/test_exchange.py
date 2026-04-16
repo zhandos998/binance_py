@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from decimal import Decimal
 
-from bot_exchange import futures_symbol_rejection_reason, get_usdt_futures_symbols
+from bot_exchange import futures_symbol_rejection_reason, get_usdt_futures_symbols, market_entry_passes_percent_filter
 from tests.support import make_config
 
 
@@ -77,6 +77,14 @@ class FakeExchangeClient:
             {"symbol": "USDCUSDT", "quoteVolume": "9000"},
         ]
 
+    def futures_mark_price(self, symbol: str | None = None) -> dict[str, str]:
+        return {"symbol": symbol or "BTCUSDT", "markPrice": "100"}
+
+    def futures_orderbook_ticker(self, symbol: str | None = None) -> dict[str, str]:
+        if symbol == "BTCUSDT":
+            return {"symbol": "BTCUSDT", "bidPrice": "99.9", "askPrice": "100.1"}
+        return {"symbol": symbol or "ETHUSDT", "bidPrice": "99", "askPrice": "101"}
+
 
 class ExchangeTests(unittest.TestCase):
     def test_futures_symbol_rejection_reason_filters_stables(self) -> None:
@@ -99,6 +107,26 @@ class ExchangeTests(unittest.TestCase):
         self.assertEqual(list(symbols), ["BTCUSDT", "ETHUSDT"])
         self.assertEqual(symbols["BTCUSDT"].quote_volume_24h, Decimal("3000"))
         self.assertNotIn("USDCUSDT", symbols)
+
+    def test_get_usdt_futures_symbols_applies_whitelist_before_limit(self) -> None:
+        config = make_config(
+            max_symbols=5,
+            symbol_selection="volume",
+            log_scanned_symbols=False,
+            symbol_whitelist=("ETHUSDT", "FUNUSDT"),
+        )
+        symbols = get_usdt_futures_symbols(FakeExchangeClient(), config)
+
+        self.assertEqual(list(symbols), ["ETHUSDT", "FUNUSDT"])
+
+    def test_market_entry_passes_percent_filter_rejects_wide_spread(self) -> None:
+        client = FakeExchangeClient()
+        config = make_config(live_trading=True, max_entry_spread_pct=0.15)
+        symbol = get_usdt_futures_symbols(client, make_config(log_scanned_symbols=False))["ETHUSDT"]
+
+        allowed = market_entry_passes_percent_filter(client, config, symbol, "BUY")
+
+        self.assertFalse(allowed)
 
 
 if __name__ == "__main__":
