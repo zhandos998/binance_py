@@ -8,7 +8,7 @@ import signal
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +24,8 @@ OPEN_LONG = "OPEN_LONG"
 OPEN_SHORT = "OPEN_SHORT"
 CLOSE_LONG = "CLOSE_LONG"
 CLOSE_SHORT = "CLOSE_SHORT"
+ORDER_TYPE_STOP_MARKET = "STOP_MARKET"
+ORDER_TYPE_TAKE_PROFIT_MARKET = "TAKE_PROFIT_MARKET"
 
 DEFAULT_DEMO_FUTURES_URL = "https://demo-fapi.binance.com/fapi"
 
@@ -64,6 +66,8 @@ ORDER_STATUS_RU = {
 
 @dataclass(frozen=True)
 class Config:
+    env_profile_file: str
+    env_profile_name: str
     api_key: str
     api_secret: str
     live_trading: bool
@@ -91,6 +95,7 @@ class Config:
     movement_lookback_candles: int
     movement_threshold_pct: float
     min_volume_ratio: float
+    require_ema_trend: bool
     buy_rsi_min: float
     buy_rsi_max: float
     sell_rsi_max: float
@@ -102,6 +107,11 @@ class Config:
     min_notional_usdt: Decimal
     stop_loss_pct: float
     take_profit_pct: float
+    place_protection_orders: bool
+    protection_working_type: str
+    protection_price_protect: bool
+    protection_trigger_buffer_pct: float
+    cancel_protection_on_close: bool
     trade_log_file: Path
     app_log_file: Path
     positions_file: Path
@@ -115,6 +125,9 @@ class SymbolMeta:
     min_qty: Decimal
     step_size: Decimal
     min_notional: Decimal
+    tick_size: Decimal
+    percent_price_up: Decimal
+    percent_price_down: Decimal
     quantity_precision: int
     quote_volume_24h: Decimal = Decimal("0")
     selection_reason: str = ""
@@ -129,6 +142,8 @@ class Position:
     margin_used: Decimal
     leverage: int
     opened_at: str
+    stop_order_id: str | None = None
+    take_profit_order_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -221,8 +236,20 @@ def normalize_futures_base_url(value: str) -> str:
     return url
 
 
-def load_config() -> Config:
+def load_environment() -> tuple[str, str]:
     load_dotenv()
+    profile_file = os.getenv("BOT_PROFILE_FILE", "").strip()
+    if profile_file:
+        profile_path = Path(profile_file)
+        if not profile_path.exists():
+            raise RuntimeError(f"Файл профиля настроек не найден: {profile_file}")
+        load_dotenv(profile_path, override=True)
+    profile_name = os.getenv("BOT_PROFILE_NAME", "default").strip() or "default"
+    return profile_file, profile_name
+
+
+def load_config() -> Config:
+    env_profile_file, env_profile_name = load_environment()
 
     legacy_testnet = env_bool("SPOT_TESTNET", True)
     futures_demo = env_bool("FUTURES_DEMO", env_bool("FUTURES_TESTNET", legacy_testnet))
@@ -236,11 +263,16 @@ def load_config() -> Config:
     margin_type = os.getenv("MARGIN_TYPE", "ISOLATED").strip().upper()
     if margin_type not in {"ISOLATED", "CROSSED"}:
         margin_type = "ISOLATED"
+    protection_working_type = os.getenv("PROTECTION_WORKING_TYPE", "MARK_PRICE").strip().upper()
+    if protection_working_type not in {"MARK_PRICE", "CONTRACT_PRICE"}:
+        protection_working_type = "MARK_PRICE"
     symbol_selection = os.getenv("SYMBOL_SELECTION", "volume").strip().lower()
     if symbol_selection not in {"volume", "alphabetical"}:
         symbol_selection = "volume"
 
     return Config(
+        env_profile_file=env_profile_file,
+        env_profile_name=env_profile_name,
         api_key=os.getenv("BINANCE_API_KEY", "").strip(),
         api_secret=os.getenv("BINANCE_API_SECRET", "").strip(),
         live_trading=env_bool("LIVE_TRADING", False),
@@ -268,6 +300,7 @@ def load_config() -> Config:
         movement_lookback_candles=env_int("MOVEMENT_LOOKBACK_CANDLES", 5, 1, None),
         movement_threshold_pct=env_float("MOVEMENT_THRESHOLD_PCT", 0.8, 0.0, None),
         min_volume_ratio=env_float("MIN_VOLUME_RATIO", 1.5, 0.0, None),
+        require_ema_trend=env_bool("REQUIRE_EMA_TREND", True),
         buy_rsi_min=env_float("BUY_RSI_MIN", 50.0, 0.0, 100.0),
         buy_rsi_max=env_float("BUY_RSI_MAX", 72.0, 0.0, 100.0),
         sell_rsi_max=env_float("SELL_RSI_MAX", 45.0, 0.0, 100.0),
@@ -279,6 +312,11 @@ def load_config() -> Config:
         min_notional_usdt=env_decimal("MIN_NOTIONAL_USDT", "5"),
         stop_loss_pct=env_float("STOP_LOSS_PCT", 2.0, 0.1, None),
         take_profit_pct=env_float("TAKE_PROFIT_PCT", 3.0, 0.0, None),
+        place_protection_orders=env_bool("PLACE_PROTECTION_ORDERS", True),
+        protection_working_type=protection_working_type,
+        protection_price_protect=env_bool("PROTECTION_PRICE_PROTECT", False),
+        protection_trigger_buffer_pct=env_float("PROTECTION_TRIGGER_BUFFER_PCT", 0.10, 0.0, None),
+        cancel_protection_on_close=env_bool("CANCEL_PROTECTION_ON_CLOSE", True),
         trade_log_file=Path(os.getenv("TRADE_LOG_FILE", "futures_trades.csv")),
         app_log_file=Path(os.getenv("APP_LOG_FILE", "bot.log")),
         positions_file=Path(os.getenv("POSITIONS_FILE", "futures_positions.json")),
@@ -346,6 +384,20 @@ def get_min_notional(filters: list[dict[str, Any]]) -> Decimal:
     if value == 0:
         value = decimal_from_filter(filters, "NOTIONAL", "minNotional", "0")
     return value
+
+
+def get_tick_size(filters: list[dict[str, Any]]) -> Decimal:
+    return decimal_from_filter(filters, "PRICE_FILTER", "tickSize", "0")
+
+
+def get_percent_price_values(filters: list[dict[str, Any]]) -> tuple[Decimal, Decimal]:
+    multiplier_up = decimal_from_filter(filters, "PERCENT_PRICE", "multiplierUp", "0")
+    multiplier_down = decimal_from_filter(filters, "PERCENT_PRICE", "multiplierDown", "0")
+    if multiplier_up <= 0:
+        multiplier_up = Decimal("1.05")
+    if multiplier_down <= 0:
+        multiplier_down = Decimal("0.95")
+    return multiplier_up, multiplier_down
 
 
 def futures_symbol_rejection_reason(symbol_info: dict[str, Any]) -> str | None:
@@ -426,6 +478,8 @@ def get_usdt_futures_symbols(client: Client, config: Config) -> dict[str, Symbol
         filters = item.get("filters", [])
         min_qty, step_size = get_market_lot_values(filters)
         min_notional = get_min_notional(filters)
+        tick_size = get_tick_size(filters)
+        percent_price_up, percent_price_down = get_percent_price_values(filters)
         symbol = item["symbol"]
         quote_volume = quote_volumes.get(symbol, Decimal("0"))
         selection_reason = (
@@ -439,6 +493,9 @@ def get_usdt_futures_symbols(client: Client, config: Config) -> dict[str, Symbol
             min_qty=min_qty,
             step_size=step_size,
             min_notional=min_notional,
+            tick_size=tick_size,
+            percent_price_up=percent_price_up,
+            percent_price_down=percent_price_down,
             quantity_precision=int(item.get("quantityPrecision", 8)),
             quote_volume_24h=quote_volume,
             selection_reason=selection_reason,
@@ -559,11 +616,13 @@ def build_open_signal(snapshot: MarketSnapshot, config: Config) -> TradeSignal |
     price = float(snapshot.close)
     trend_up = price > snapshot.ema_fast > snapshot.ema_slow
     trend_down = price < snapshot.ema_fast < snapshot.ema_slow
+    long_trend_ok = trend_up or not config.require_ema_trend
+    short_trend_ok = trend_down or not config.require_ema_trend
     volume_ok = snapshot.volume_ratio >= config.min_volume_ratio
 
     if (
         snapshot.pct_change >= config.movement_threshold_pct
-        and trend_up
+        and long_trend_ok
         and volume_ok
         and config.buy_rsi_min <= snapshot.rsi <= config.buy_rsi_max
     ):
@@ -576,7 +635,7 @@ def build_open_signal(snapshot: MarketSnapshot, config: Config) -> TradeSignal |
 
     if (
         snapshot.pct_change <= -config.movement_threshold_pct
-        and trend_down
+        and short_trend_ok
         and volume_ok
         and snapshot.rsi <= config.sell_rsi_max
     ):
@@ -607,7 +666,7 @@ def explain_no_open_signal(snapshot: MarketSnapshot, config: Config) -> str:
     long_blockers: list[str] = []
     if snapshot.pct_change < config.movement_threshold_pct:
         long_blockers.append(f"рост {snapshot.pct_change:.2f}% < порога {config.movement_threshold_pct:.2f}%")
-    if not trend_up:
+    if config.require_ema_trend and not trend_up:
         long_blockers.append("нет EMA-тренда вверх")
     if not volume_ok:
         long_blockers.append(f"объем {snapshot.volume_ratio:.2f} < порога {config.min_volume_ratio:.2f}")
@@ -619,7 +678,7 @@ def explain_no_open_signal(snapshot: MarketSnapshot, config: Config) -> str:
     short_blockers: list[str] = []
     if snapshot.pct_change > -config.movement_threshold_pct:
         short_blockers.append(f"падение {snapshot.pct_change:.2f}% слабее порога -{config.movement_threshold_pct:.2f}%")
-    if not trend_down:
+    if config.require_ema_trend and not trend_down:
         short_blockers.append("нет EMA-тренда вниз")
     if not volume_ok:
         short_blockers.append(f"объем {snapshot.volume_ratio:.2f} < порога {config.min_volume_ratio:.2f}")
@@ -658,7 +717,7 @@ def signal_blockers(snapshot: MarketSnapshot, config: Config, direction: str) ->
     if direction == LONG:
         if snapshot.pct_change < config.movement_threshold_pct:
             blockers.append("движение")
-        if not trend_up:
+        if config.require_ema_trend and not trend_up:
             blockers.append("EMA")
         if not volume_ok:
             blockers.append("объем")
@@ -667,7 +726,7 @@ def signal_blockers(snapshot: MarketSnapshot, config: Config, direction: str) ->
     else:
         if snapshot.pct_change > -config.movement_threshold_pct:
             blockers.append("движение")
-        if not trend_down:
+        if config.require_ema_trend and not trend_down:
             blockers.append("EMA")
         if not volume_ok:
             blockers.append("объем")
@@ -796,6 +855,8 @@ def load_positions(config: Config) -> dict[str, Position]:
             margin_used=Decimal(str(item.get("margin_used", "0"))),
             leverage=int(item.get("leverage", config.leverage)),
             opened_at=item.get("opened_at", utc_now()),
+            stop_order_id=item.get("stop_order_id"),
+            take_profit_order_id=item.get("take_profit_order_id"),
         )
     return positions
 
@@ -807,6 +868,8 @@ def save_positions(config: Config, positions: dict[str, Position]) -> None:
         item["entry_price"] = str(position.entry_price)
         item["quantity"] = str(position.quantity)
         item["margin_used"] = str(position.margin_used)
+        item["stop_order_id"] = position.stop_order_id
+        item["take_profit_order_id"] = position.take_profit_order_id
         serializable[symbol] = item
 
     with config.positions_file.open("w", encoding="utf-8") as file:
@@ -878,6 +941,48 @@ def round_step(value: Decimal, step_size: Decimal) -> Decimal:
     return (value / step_size).to_integral_value(rounding=ROUND_DOWN) * step_size
 
 
+def round_price(value: Decimal, tick_size: Decimal) -> Decimal:
+    if tick_size <= 0:
+        return value
+    return (value / tick_size).to_integral_value(rounding=ROUND_DOWN) * tick_size
+
+
+def round_price_up(value: Decimal, tick_size: Decimal) -> Decimal:
+    if tick_size <= 0:
+        return value
+    return (value / tick_size).to_integral_value(rounding=ROUND_UP) * tick_size
+
+
+def normalize_stop_price(value: Decimal, tick_size: Decimal, entry_price: Decimal, direction: str, is_stop_loss: bool) -> Decimal:
+    price = round_price(value, tick_size)
+    if tick_size <= 0:
+        return price
+
+    if direction == LONG and not is_stop_loss and price <= entry_price:
+        price = round_price(entry_price + tick_size, tick_size)
+    elif direction == SHORT and is_stop_loss and price <= entry_price:
+        price = round_price(entry_price + tick_size, tick_size)
+    elif direction == SHORT and not is_stop_loss and price >= entry_price:
+        price = round_price(entry_price - tick_size, tick_size)
+    elif direction == LONG and is_stop_loss and price >= entry_price:
+        price = round_price(entry_price - tick_size, tick_size)
+
+    return max(price, tick_size)
+
+
+def extract_decimal_from_order(order_response: dict[str, Any] | None, keys: tuple[str, ...], fallback: Decimal) -> Decimal:
+    if not order_response:
+        return fallback
+    for key in keys:
+        raw_value = order_response.get(key)
+        if raw_value is None:
+            continue
+        value = Decimal(str(raw_value))
+        if value > 0:
+            return value
+    return fallback
+
+
 def futures_available_usdt(client: Client, config: Config) -> Decimal:
     if not config.live_trading:
         return config.dry_run_usdt_balance
@@ -887,6 +992,55 @@ def futures_available_usdt(client: Client, config: Config) -> Decimal:
         if item.get("asset") == "USDT":
             return Decimal(str(item.get("availableBalance", item.get("balance", "0"))))
     return Decimal("0")
+
+
+def get_entry_reference_prices(client: Client, symbol: str) -> tuple[Decimal, Decimal, Decimal]:
+    mark_data = client.futures_mark_price(symbol=symbol)
+    orderbook = client.futures_orderbook_ticker(symbol=symbol)
+    mark_price = Decimal(str(mark_data.get("markPrice", "0")))
+    bid_price = Decimal(str(orderbook.get("bidPrice", "0")))
+    ask_price = Decimal(str(orderbook.get("askPrice", "0")))
+    return mark_price, bid_price, ask_price
+
+
+def market_entry_passes_percent_filter(client: Client, config: Config, symbol_meta: SymbolMeta, side: str) -> bool:
+    if not config.live_trading:
+        return True
+
+    try:
+        mark_price, bid_price, ask_price = get_entry_reference_prices(client, symbol_meta.symbol)
+    except (BinanceAPIException, BinanceRequestException) as exc:
+        logging.warning("%s: не удалось проверить PERCENT_PRICE перед входом: %s", symbol_meta.symbol, exc)
+        return False
+
+    if mark_price <= 0 or bid_price <= 0 or ask_price <= 0:
+        logging.info("%s: пропуск входа - некорректные bid/ask/mark цены.", symbol_meta.symbol)
+        return False
+
+    if side == SIDE_BUY:
+        limit_price = mark_price * symbol_meta.percent_price_up
+        if ask_price > limit_price:
+            logging.info(
+                "%s: пропуск BUY - ask=%s выше PERCENT_PRICE лимита %s от mark=%s.",
+                symbol_meta.symbol,
+                ask_price,
+                limit_price,
+                mark_price,
+            )
+            return False
+    else:
+        limit_price = mark_price * symbol_meta.percent_price_down
+        if bid_price < limit_price:
+            logging.info(
+                "%s: пропуск SELL - bid=%s ниже PERCENT_PRICE лимита %s от mark=%s.",
+                symbol_meta.symbol,
+                bid_price,
+                limit_price,
+                mark_price,
+            )
+            return False
+
+    return True
 
 
 def calculate_order_size(
@@ -907,6 +1061,18 @@ def calculate_order_size(
     notional = min(max_notional_by_risk, max_notional_by_margin)
 
     effective_min_notional = max(config.min_notional_usdt, symbol_meta.min_notional)
+    if max_notional_by_margin < effective_min_notional:
+        logging.info(
+            "Пропуск %s: MAX_MARGIN_USDT=%s * LEVERAGE=%s дает максимум %s USDT notional, "
+            "а минимум для сделки %s USDT. Увеличь MAX_MARGIN_USDT или LEVERAGE.",
+            symbol_meta.symbol,
+            config.max_margin_usdt,
+            config.leverage,
+            max_notional_by_margin.quantize(Decimal("0.01"), rounding=ROUND_DOWN),
+            effective_min_notional,
+        )
+        return None
+
     if notional < effective_min_notional:
         logging.info(
             "Пропуск %s: расчетный notional %s USDT ниже минимума %s USDT.",
@@ -951,6 +1117,437 @@ def calculate_order_size(
     return OrderSize(quantity, actual_notional, actual_margin, risk_at_stop)
 
 
+def protection_prices(
+    config: Config,
+    symbol_meta: SymbolMeta,
+    direction: str,
+    entry_price: Decimal,
+    trigger_reference_price: Decimal | None = None,
+) -> tuple[Decimal, Decimal]:
+    stop_fraction = Decimal(str(config.stop_loss_pct)) / Decimal("100")
+    take_fraction = Decimal(str(config.take_profit_pct)) / Decimal("100")
+    buffer_fraction = Decimal(str(config.protection_trigger_buffer_pct)) / Decimal("100")
+
+    if direction == LONG:
+        raw_stop = entry_price * (Decimal("1") - stop_fraction)
+        raw_take = entry_price * (Decimal("1") + take_fraction)
+    else:
+        raw_stop = entry_price * (Decimal("1") + stop_fraction)
+        raw_take = entry_price * (Decimal("1") - take_fraction)
+
+    stop_price = normalize_stop_price(raw_stop, symbol_meta.tick_size, entry_price, direction, True)
+    take_price = normalize_stop_price(raw_take, symbol_meta.tick_size, entry_price, direction, False)
+
+    if trigger_reference_price and trigger_reference_price > 0:
+        if direction == LONG:
+            max_stop = trigger_reference_price * (Decimal("1") - buffer_fraction)
+            min_take = trigger_reference_price * (Decimal("1") + buffer_fraction)
+            if stop_price > max_stop:
+                stop_price = round_price(max_stop, symbol_meta.tick_size)
+            if take_price < min_take:
+                take_price = round_price_up(min_take, symbol_meta.tick_size)
+        else:
+            min_stop = trigger_reference_price * (Decimal("1") + buffer_fraction)
+            max_take = trigger_reference_price * (Decimal("1") - buffer_fraction)
+            if stop_price < min_stop:
+                stop_price = round_price_up(min_stop, symbol_meta.tick_size)
+            if take_price > max_take:
+                take_price = round_price(max_take, symbol_meta.tick_size)
+
+        stop_price = normalize_stop_price(stop_price, symbol_meta.tick_size, trigger_reference_price, direction, True)
+        take_price = normalize_stop_price(take_price, symbol_meta.tick_size, trigger_reference_price, direction, False)
+
+    return stop_price, take_price
+
+
+def current_protection_trigger_price(client: Client, config: Config, symbol: str, fallback: Decimal) -> Decimal:
+    if not config.live_trading:
+        return fallback
+    try:
+        if config.protection_working_type == "MARK_PRICE":
+            mark_data = client.futures_mark_price(symbol=symbol)
+            mark_price = Decimal(str(mark_data.get("markPrice", "0")))
+            if mark_price > 0:
+                return mark_price
+        ticker = client.futures_symbol_ticker(symbol=symbol)
+        last_price = Decimal(str(ticker.get("price", "0")))
+        if last_price > 0:
+            return last_price
+    except (BinanceAPIException, BinanceRequestException) as exc:
+        logging.warning("%s: не удалось получить trigger reference price для проверки SL/TP: %s", symbol, exc)
+    return fallback
+
+
+def adjusted_trigger_price(
+    reference_price: Decimal,
+    symbol_meta: SymbolMeta,
+    direction: str,
+    is_stop_loss: bool,
+    buffer_pct: float,
+) -> Decimal:
+    buffer_fraction = Decimal(str(buffer_pct)) / Decimal("100")
+    if direction == LONG:
+        if is_stop_loss:
+            return round_price(reference_price * (Decimal("1") - buffer_fraction), symbol_meta.tick_size)
+        return round_price_up(reference_price * (Decimal("1") + buffer_fraction), symbol_meta.tick_size)
+
+    if is_stop_loss:
+        return round_price_up(reference_price * (Decimal("1") + buffer_fraction), symbol_meta.tick_size)
+    return round_price(reference_price * (Decimal("1") - buffer_fraction), symbol_meta.tick_size)
+
+
+def protection_client_order_id(prefix: str, symbol: str) -> str:
+    millis = int(time.time() * 1000) % 1_000_000_000
+    return f"bot_{prefix}_{symbol.lower()}_{millis}"[:36]
+
+
+def build_protection_order_params(
+    config: Config,
+    signal: TradeSignal,
+    order_type: str,
+    stop_price: Decimal,
+    client_order_id: str,
+) -> dict[str, str]:
+    params = {
+        "algoType": "CONDITIONAL",
+        "symbol": signal.symbol,
+        "side": close_side_for_direction(signal.direction),
+        "type": order_type,
+        "triggerPrice": decimal_to_str(stop_price),
+        "closePosition": "true",
+        "workingType": config.protection_working_type,
+        "clientAlgoId": client_order_id,
+    }
+    if config.protection_price_protect:
+        params["priceProtect"] = "TRUE"
+    return params
+
+
+def futures_create_algo_order(client: Client, **params: str) -> dict[str, Any]:
+    return client._request_futures_api("post", "algoOrder", True, data=params)
+
+
+def futures_cancel_algo_order(client: Client, algo_id: str) -> dict[str, Any]:
+    return client._request_futures_api("delete", "algoOrder", True, data={"algoId": algo_id})
+
+
+def futures_open_algo_orders(client: Client, symbol: str) -> list[dict[str, Any]]:
+    response = client._request_futures_api("get", "openAlgoOrders", True, data={"symbol": symbol})
+    if isinstance(response, list):
+        return response
+    if isinstance(response, dict):
+        for key in ("orders", "data", "list"):
+            value = response.get(key)
+            if isinstance(value, list):
+                return value
+    return []
+
+
+def find_existing_protection_algo_ids(
+    client: Client,
+    symbol: str,
+    close_side: str,
+) -> tuple[str | None, str | None]:
+    stop_algo_id: str | None = None
+    take_profit_algo_id: str | None = None
+    try:
+        open_orders = futures_open_algo_orders(client, symbol)
+    except (BinanceAPIException, BinanceRequestException) as exc:
+        logging.warning("%s: не удалось получить открытые algo-ордера: %s", symbol, exc)
+        return None, None
+
+    for order in open_orders:
+        order_side = str(order.get("side", ""))
+        order_type = str(order.get("type", ""))
+        close_position = str(order.get("closePosition", "")).lower()
+        reduce_only = str(order.get("reduceOnly", "")).lower()
+        if order_side != close_side:
+            continue
+        if close_position != "true" and reduce_only != "true":
+            continue
+
+        algo_id = str(order.get("algoId", order.get("orderId", "")))
+        if not algo_id:
+            continue
+        if order_type == ORDER_TYPE_STOP_MARKET and stop_algo_id is None:
+            stop_algo_id = algo_id
+        elif order_type == ORDER_TYPE_TAKE_PROFIT_MARKET and take_profit_algo_id is None:
+            take_profit_algo_id = algo_id
+
+    return stop_algo_id, take_profit_algo_id
+
+
+def create_protection_algo_order_with_retry(
+    client: Client,
+    config: Config,
+    symbol_meta: SymbolMeta,
+    signal: TradeSignal,
+    params: dict[str, str],
+    is_stop_loss: bool,
+) -> dict[str, Any]:
+    try:
+        return futures_create_algo_order(client, **params)
+    except BinanceAPIException as exc:
+        if exc.code != -2021:
+            raise
+
+        reference_price = current_protection_trigger_price(client, config, signal.symbol, signal.price)
+        retry_buffer_pct = max(config.protection_trigger_buffer_pct * 3, 0.50)
+        retry_trigger_price = adjusted_trigger_price(
+            reference_price=reference_price,
+            symbol_meta=symbol_meta,
+            direction=signal.direction,
+            is_stop_loss=is_stop_loss,
+            buffer_pct=retry_buffer_pct,
+        )
+        retry_params = dict(params)
+        retry_params["triggerPrice"] = decimal_to_str(retry_trigger_price)
+        retry_params["clientAlgoId"] = protection_client_order_id(
+            "slr" if is_stop_loss else "tpr",
+            signal.symbol,
+        )
+        logging.warning(
+            "%s: защитный algo-ордер %s с trigger=%s сработал бы сразу. Повтор: trigger=%s, reference=%s, buffer=%.2f%%.",
+            signal.symbol,
+            "SL" if is_stop_loss else "TP",
+            params.get("triggerPrice"),
+            retry_trigger_price,
+            reference_price,
+            retry_buffer_pct,
+        )
+        return futures_create_algo_order(client, **retry_params)
+
+
+def place_protection_orders(
+    client: Client,
+    config: Config,
+    symbol_meta: SymbolMeta,
+    signal: TradeSignal,
+    entry_price: Decimal,
+) -> tuple[str | None, str | None]:
+    if not config.place_protection_orders:
+        return None, None
+
+    trigger_reference_price = current_protection_trigger_price(client, config, signal.symbol, entry_price)
+    stop_price, take_price = protection_prices(
+        config,
+        symbol_meta,
+        signal.direction,
+        entry_price,
+        trigger_reference_price,
+    )
+    if trigger_reference_price != entry_price:
+        logging.info(
+            "%s: расчет защиты от entry=%s проверен по MARK_PRICE=%s. SL=%s, TP=%s.",
+            signal.symbol,
+            entry_price,
+            trigger_reference_price,
+            stop_price,
+            take_price if config.take_profit_pct > 0 else "выключен",
+        )
+    stop_params = build_protection_order_params(
+        config,
+        signal,
+        ORDER_TYPE_STOP_MARKET,
+        stop_price,
+        protection_client_order_id("sl", signal.symbol),
+    )
+    take_params = None
+    if config.take_profit_pct > 0:
+        take_params = build_protection_order_params(
+            config,
+            signal,
+            ORDER_TYPE_TAKE_PROFIT_MARKET,
+            take_price,
+            protection_client_order_id("tp", signal.symbol),
+        )
+
+    if not config.live_trading:
+        logging.info(
+            "Защитные ордера %s (симуляция): SL=%s, TP=%s, workingType=%s.",
+            signal.symbol,
+            stop_price,
+            take_price if take_params else "выключен",
+            config.protection_working_type,
+        )
+        return None, None
+
+    stop_order_id: str | None = None
+    take_profit_order_id: str | None = None
+
+    existing_stop_id, existing_take_profit_id = find_existing_protection_algo_ids(
+        client,
+        signal.symbol,
+        close_side_for_direction(signal.direction),
+    )
+    if existing_stop_id and (existing_take_profit_id or config.take_profit_pct <= 0):
+        logging.info(
+            "%s: защитные algo-ордера уже есть на Binance: SL=%s, TP=%s.",
+            signal.symbol,
+            existing_stop_id,
+            existing_take_profit_id or "выключен",
+        )
+        return existing_stop_id, existing_take_profit_id
+
+    if config.use_test_order:
+        logging.info(
+            "Защитные algo-ордера %s не размещаются при USE_TEST_ORDER=true. Расчет: SL=%s, TP=%s.",
+            signal.symbol,
+            stop_price,
+            take_price if take_params else "выключен",
+        )
+        return None, None
+
+    if existing_stop_id:
+        stop_order_id = existing_stop_id
+    else:
+        try:
+            stop_response = create_protection_algo_order_with_retry(
+                client,
+                config,
+                symbol_meta,
+                signal,
+                stop_params,
+                True,
+            )
+            stop_order_id = str(stop_response.get("algoId", ""))
+        except BinanceAPIException as exc:
+            if exc.code != -4130:
+                raise
+            stop_order_id, existing_take_profit_id = find_existing_protection_algo_ids(
+                client,
+                signal.symbol,
+                close_side_for_direction(signal.direction),
+            )
+            if not stop_order_id:
+                raise
+            logging.info("%s: SL уже существовал на Binance, привязан algoId=%s.", signal.symbol, stop_order_id)
+
+    if take_params:
+        if existing_take_profit_id:
+            take_profit_order_id = existing_take_profit_id
+        else:
+            try:
+                take_response = create_protection_algo_order_with_retry(
+                    client,
+                    config,
+                    symbol_meta,
+                    signal,
+                    take_params,
+                    False,
+                )
+                take_profit_order_id = str(take_response.get("algoId", ""))
+            except BinanceAPIException as exc:
+                if exc.code == -4130:
+                    _, take_profit_order_id = find_existing_protection_algo_ids(
+                        client,
+                        signal.symbol,
+                        close_side_for_direction(signal.direction),
+                    )
+                    if take_profit_order_id:
+                        logging.info("%s: TP уже существовал на Binance, привязан algoId=%s.", signal.symbol, take_profit_order_id)
+                    else:
+                        raise
+                else:
+                    if stop_order_id and stop_order_id != existing_stop_id:
+                        try:
+                            futures_cancel_algo_order(client, stop_order_id)
+                            logging.warning("%s: SL algoId=%s отменен, потому что TP не был поставлен.", signal.symbol, stop_order_id)
+                        except BinanceAPIException as cancel_exc:
+                            logging.warning("%s: не удалось отменить SL algoId=%s после ошибки TP: %s", signal.symbol, stop_order_id, cancel_exc)
+                    raise
+            except Exception:
+                if stop_order_id and stop_order_id != existing_stop_id:
+                    try:
+                        futures_cancel_algo_order(client, stop_order_id)
+                        logging.warning("%s: SL algoId=%s отменен, потому что TP не был поставлен.", signal.symbol, stop_order_id)
+                    except BinanceAPIException as cancel_exc:
+                        logging.warning("%s: не удалось отменить SL algoId=%s после ошибки TP: %s", signal.symbol, stop_order_id, cancel_exc)
+                raise
+    logging.info(
+        "Поставлены биржевые защитные algo-ордера %s: SL=%s algoId=%s, TP=%s algoId=%s.",
+        signal.symbol,
+        stop_price,
+        stop_order_id,
+        take_price if take_params else "выключен",
+        take_profit_order_id or "-",
+    )
+    return stop_order_id or None, take_profit_order_id or None
+
+
+def cancel_protection_orders(client: Client, config: Config, position: Position) -> None:
+    if not config.live_trading or config.use_test_order or not config.cancel_protection_on_close:
+        return
+
+    order_ids = [position.stop_order_id, position.take_profit_order_id]
+    for order_id in order_ids:
+        if not order_id:
+            continue
+        try:
+            futures_cancel_algo_order(client, order_id)
+            logging.info("%s: защитный algo-ордер %s отменен.", position.symbol, order_id)
+        except BinanceAPIException as exc:
+            if exc.code in {-2011, -2013}:
+                logging.info("%s: защитный algo-ордер %s уже не активен.", position.symbol, order_id)
+            else:
+                logging.warning("%s: не удалось отменить защитный algo-ордер %s: %s", position.symbol, order_id, exc)
+
+
+def ensure_position_has_protection(
+    client: Client,
+    config: Config,
+    symbols: dict[str, SymbolMeta],
+    position: Position,
+) -> Position:
+    if (
+        not config.live_trading
+        or config.use_test_order
+        or not config.place_protection_orders
+        or (position.stop_order_id and (position.take_profit_order_id or config.take_profit_pct <= 0))
+    ):
+        return position
+
+    symbol_meta = symbols.get(position.symbol)
+    if symbol_meta is None:
+        return position
+
+    signal = TradeSignal(
+        symbol=position.symbol,
+        action=OPEN_LONG if position.direction == LONG else OPEN_SHORT,
+        side=SIDE_BUY if position.direction == LONG else SIDE_SELL,
+        direction=position.direction,
+        score=0,
+        price=position.entry_price,
+        reason="восстановление защитных ордеров для уже открытой позиции",
+    )
+    try:
+        stop_order_id, take_profit_order_id = place_protection_orders(
+            client=client,
+            config=config,
+            symbol_meta=symbol_meta,
+            signal=signal,
+            entry_price=position.entry_price,
+        )
+    except (BinanceAPIException, BinanceRequestException) as exc:
+        logging.error("%s: не удалось восстановить защитные algo-ордера: %s", position.symbol, exc)
+        return position
+    except Exception:
+        logging.exception("%s: неожиданная ошибка при восстановлении защитных algo-ордеров.", position.symbol)
+        return position
+
+    return Position(
+        symbol=position.symbol,
+        direction=position.direction,
+        entry_price=position.entry_price,
+        quantity=position.quantity,
+        margin_used=position.margin_used,
+        leverage=position.leverage,
+        opened_at=position.opened_at,
+        stop_order_id=stop_order_id,
+        take_profit_order_id=take_profit_order_id,
+    )
+
+
 def sync_live_positions(
     client: Client,
     config: Config,
@@ -959,6 +1556,7 @@ def sync_live_positions(
     if not config.live_trading or config.use_test_order:
         return load_positions(config)
 
+    known_positions = load_positions(config)
     live_positions: dict[str, Position] = {}
     raw_positions = client.futures_position_information()
     for item in raw_positions:
@@ -978,16 +1576,24 @@ def sync_live_positions(
         leverage = int(item.get("leverage", config.leverage))
         direction = LONG if amount > 0 else SHORT
         margin_used = Decimal("0") if leverage <= 0 else (quantity * entry_price) / Decimal(leverage)
+        known_position = known_positions.get(symbol)
 
-        live_positions[symbol] = Position(
+        position = Position(
             symbol=symbol,
             direction=direction,
             entry_price=entry_price,
             quantity=quantity,
             margin_used=margin_used,
             leverage=leverage,
-            opened_at=utc_now(),
+            opened_at=known_position.opened_at if known_position else utc_now(),
+            stop_order_id=known_position.stop_order_id if known_position else None,
+            take_profit_order_id=known_position.take_profit_order_id if known_position else None,
         )
+        live_positions[symbol] = ensure_position_has_protection(client, config, symbols, position)
+
+    for symbol, known_position in known_positions.items():
+        if symbol not in live_positions:
+            cancel_protection_orders(client, config, known_position)
 
     save_positions(config, live_positions)
     return live_positions
@@ -1232,6 +1838,9 @@ def place_open_order(
     if order_size is None:
         return False
 
+    if not market_entry_passes_percent_filter(client, config, symbol_meta, signal.side):
+        return False
+
     status = "СИМУЛЯЦИЯ"
     order_response: dict[str, Any] | None = None
 
@@ -1242,23 +1851,52 @@ def place_open_order(
             "side": signal.side,
             "type": ORDER_TYPE_MARKET,
             "quantity": decimal_to_str(order_size.quantity),
+            "newOrderRespType": "RESULT",
         }
         if config.use_test_order:
             order_response = client.futures_create_test_order(**params)
             status = "ТЕСТОВЫЙ_ОРДЕР_ПРИНЯТ_БЕЗ_ИСПОЛНЕНИЯ"
         else:
-            order_response = client.futures_create_order(**params)
-            status = translate_order_status(str(order_response.get("status", "SUBMITTED")))
+            try:
+                order_response = client.futures_create_order(**params)
+                status = translate_order_status(str(order_response.get("status", "SUBMITTED")))
+            except BinanceAPIException as exc:
+                if exc.code == -4131:
+                    logging.warning(
+                        "%s: market-вход пропущен: counterparty best price не прошел PERCENT_PRICE фильтр Binance.",
+                        signal.symbol,
+                    )
+                    return False
+                raise
+
+    entry_price = extract_decimal_from_order(order_response, ("avgPrice", "price"), signal.price)
+    executed_qty = extract_decimal_from_order(order_response, ("executedQty", "origQty"), order_size.quantity)
+    stop_order_id: str | None = None
+    take_profit_order_id: str | None = None
+    try:
+        stop_order_id, take_profit_order_id = place_protection_orders(
+            client=client,
+            config=config,
+            symbol_meta=symbol_meta,
+            signal=signal,
+            entry_price=entry_price,
+        )
+    except (BinanceAPIException, BinanceRequestException) as exc:
+        logging.error("%s: позиция открыта, но защитные ордера не поставлены: %s", signal.symbol, exc)
+    except Exception:
+        logging.exception("%s: позиция открыта, но произошла ошибка при постановке защитных ордеров.", signal.symbol)
 
     if not config.live_trading or not config.use_test_order:
         positions[signal.symbol] = Position(
             symbol=signal.symbol,
             direction=signal.direction,
-            entry_price=signal.price,
-            quantity=order_size.quantity,
-            margin_used=order_size.margin,
+            entry_price=entry_price,
+            quantity=executed_qty,
+            margin_used=(executed_qty * entry_price) / Decimal(config.leverage),
             leverage=config.leverage,
             opened_at=utc_now(),
+            stop_order_id=stop_order_id,
+            take_profit_order_id=take_profit_order_id,
         )
         save_positions(config, positions)
 
@@ -1308,12 +1946,14 @@ def place_close_order(
     order_response: dict[str, Any] | None = None
 
     if config.live_trading:
+        cancel_protection_orders(client, config, position)
         params = {
             "symbol": signal.symbol,
             "side": signal.side,
             "type": ORDER_TYPE_MARKET,
             "quantity": decimal_to_str(quantity),
             "reduceOnly": "true",
+            "newOrderRespType": "RESULT",
         }
         if config.use_test_order:
             order_response = client.futures_create_test_order(**params)
@@ -1404,6 +2044,11 @@ def main() -> None:
     mode = "РЕАЛЬНЫЙ" if config.live_trading else "СИМУЛЯЦИЯ"
     endpoint = config.futures_base_url if config.futures_base_url else "live futures endpoint"
     logging.info("Запуск Binance USDT-M Futures бота. Режим: %s. Endpoint: %s", mode, endpoint)
+    logging.info(
+        "Профиль настроек: %s%s",
+        config.env_profile_name,
+        f" ({config.env_profile_file})" if config.env_profile_file else "",
+    )
     if config.use_test_order:
         logging.info("USE_TEST_ORDER=true: ордера будут только проверяться, без исполнения.")
 
@@ -1446,3 +2091,14 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+# cd /d d:\zhandos998\Desktop\binance_py
+# .venv\Scripts\activate.bat
+# set BOT_PROFILE_FILE=.env.work
+# python bot.py

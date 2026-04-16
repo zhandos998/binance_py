@@ -21,6 +21,7 @@
 - `SELL` открывает `SHORT`, если есть сильное движение вниз, объем выше среднего, цена ниже EMA и RSI слабый.
 - Если уже открыта позиция, противоположный сигнал закрывает позицию reduce-only ордером.
 - Stop-loss и take-profit закрывают позицию отдельно для LONG и SHORT.
+- После открытия позиции бот ставит на Binance защитные `STOP_MARKET` и `TAKE_PROFIT_MARKET` ордера с `closePosition=true`.
 
 Бот рассчитан на One-way position mode. При `ENSURE_ONE_WAY_MODE=true` он пытается переключить аккаунт в One-way перед запуском.
 
@@ -63,6 +64,51 @@ LIVE_TRADING=false
 py bot.py
 ```
 
+## Профили настроек
+
+API ключи остаются в `.env`. Для стратегии есть отдельные профили без ключей:
+
+- `.env.work` - более спокойный рабочий demo-профиль на `15m`.
+- `.env.test` - агрессивный demo-профиль на `1m`, чтобы быстрее проверить входы, SL/TP и закрытие.
+
+Запуск тестового профиля:
+
+```powershell
+$env:BOT_PROFILE_FILE=".env.test"
+py bot.py
+```
+
+Запуск рабочего профиля:
+
+```powershell
+$env:BOT_PROFILE_FILE=".env.work"
+py bot.py
+```
+
+Сброс выбранного профиля:
+
+```powershell
+Remove-Item Env:BOT_PROFILE_FILE
+```
+
+В `.env.test` специально ослаблены фильтры:
+
+```text
+MOVEMENT_THRESHOLD_PCT=0.01
+MIN_VOLUME_RATIO=0.05
+REQUIRE_EMA_TREND=false
+BUY_RSI_MIN=0
+BUY_RSI_MAX=100
+SELL_RSI_MAX=100
+MAX_OPEN_POSITIONS=1
+MAX_TRADES_PER_CYCLE=1
+MAX_MARGIN_USDT=3
+STOP_LOSS_PCT=0.3
+TAKE_PROFIT_PCT=0.5
+```
+
+Этот профиль нужен только для проверки механики покупки/продажи на demo futures, не для нормальной торговли.
+
 В этом режиме бот только симулирует сделки и пишет:
 
 - `bot.log`;
@@ -93,6 +139,9 @@ MAX_TRADES_PER_CYCLE=1
 MAX_OPEN_POSITIONS=2
 LEVERAGE=2
 MAX_MARGIN_USDT=5
+PLACE_PROTECTION_ORDERS=true
+PROTECTION_WORKING_TYPE=MARK_PRICE
+PROTECTION_TRIGGER_BUFFER_PCT=0.20
 ```
 
 После этого:

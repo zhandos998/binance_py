@@ -2,19 +2,23 @@
   "ARIAUSDT": {
     "symbol": "ARIAUSDT",
     "direction": "SHORT",
-    "entry_price": "0.10659",
-    "quantity": "571",
-    "margin_used": "20.28763",
+    "entry_price": "0.1046",
+    "quantity": "572",
+    "margin_used": "19.94373333333333333333333333",
     "leverage": 3,
-    "opened_at": "2026-04-15T13:41:04+00:00"
+    "opened_at": "2026-04-15T18:24:18+00:00",
+    "stop_order_id": "1000000049951779",
+    "take_profit_order_id": "1000000049951783"
   },
   "RAVEUSDT": {
     "symbol": "RAVEUSDT",
-    "direction": "SHORT",
-    "entry_price": "11.40571",
-    "quantity": "5",
-    "margin_used": "19.00951666666666666666666667",
+    "direction": "LONG",
+    "entry_price": "12.38405",
+    "quantity": "4",
+    "margin_used": "16.51206666666666666666666667",
     "leverage": 3,
-    "opened_at": "2026-04-15T13:41:04+00:00"
+    "opened_at": "2026-04-15T18:17:58+00:00",
+    "stop_order_id": "1000000049951787",
+    "take_profit_order_id": "1000000049951791"
   }
 }
