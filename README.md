@@ -1,42 +1,136 @@
 # Binance USDT-M Futures Momentum Bot
 
-Бот работает с Binance USDT-M Futures через `python-binance`.
+Бот для Binance USDT-M Futures на `python-binance`.
+
+Что умеет:
+
+- сканировать `USDT-M perpetual` контракты;
+- считать `EMA`, `RSI`, `volume ratio`, `movement`;
+- открывать `LONG` и `SHORT`;
+- ставить защитные `SL/TP` через algo orders;
+- вести позиции, журнал сделок и risk-state;
+- считать статистику по сделкам;
+- запускать backtest и walk-forward.
+
+## Архитектура
+
+- [bot.py](d:/zhandos998/Desktop/binance_py/bot.py) — запуск и основной цикл.
+- [bot_base.py](d:/zhandos998/Desktop/binance_py/bot_base.py) — конфиг, dataclass-структуры, базовые утилиты.
+- [bot_exchange.py](d:/zhandos998/Desktop/binance_py/bot_exchange.py) — universe и metadata по символам.
+- [bot_market.py](d:/zhandos998/Desktop/binance_py/bot_market.py) — свечи, funding и `MarketSnapshot`.
+- [bot_strategy.py](d:/zhandos998/Desktop/binance_py/bot_strategy.py) — сигналы и блокеры входа.
+- [bot_risk.py](d:/zhandos998/Desktop/binance_py/bot_risk.py) — risk-state, cooldown, sizing.
+- [bot_state.py](d:/zhandos998/Desktop/binance_py/bot_state.py) — позиции и журнал сделок.
+- [bot_storage.py](d:/zhandos998/Desktop/binance_py/bot_storage.py) — SQLite-хранилище и lazy-миграция legacy `CSV/JSON`.
+- [bot_execution.py](d:/zhandos998/Desktop/binance_py/bot_execution.py) — ордера, protection, sync live positions.
+- [bot_scan.py](d:/zhandos998/Desktop/binance_py/bot_scan.py) — scan рынка и close-on-opposite signal.
+- [bot_reporting.py](d:/zhandos998/Desktop/binance_py/bot_reporting.py) — summary логов.
+- [trade_stats.py](d:/zhandos998/Desktop/binance_py/trade_stats.py) — статистика по журналу сделок.
+- [backtest.py](d:/zhandos998/Desktop/binance_py/backtest.py) — backtest и walk-forward.
+- [tests](d:/zhandos998/Desktop/binance_py/tests) — unit-тесты.
 
 ## Стратегия
 
-Бот сканирует активные perpetual-пары с `USDT` каждые 1-5 минут и считает:
+Бот строит входы на базе:
 
-- EMA fast / EMA slow для направления тренда;
-- RSI для подтверждения momentum;
-- изменение цены за несколько закрытых свечей;
-- текущий объем относительно среднего объема.
+- momentum по последним закрытым свечам;
+- базового тренда `EMA fast / EMA slow`;
+- `RSI`;
+- всплеска объема;
+- фильтра старшего таймфрейма;
+- фильтра funding-rate.
 
-При `LOG_SCANNED_SYMBOLS=true` бот пишет в лог список монет, которые попали в скан, и объясняет фильтр отбора. Если `MAX_SYMBOLS > 0`, по умолчанию выбираются самые ликвидные контракты по `24h quoteVolume`, потому что `SYMBOL_SELECTION=volume`.
+Логика:
 
-При `LOG_SCAN_SUMMARY=true` бот пишет короткую сводку: сколько сигналов найдено, главные причины отказа и таблицу ближайших кандидатов. `LOG_SYMBOL_DECISIONS=true` включает подробную строку по каждой монете, но обычно это слишком шумно.
+- `BUY` открывает `LONG`, если есть восходящий импульс, объем и подтверждение по тренду;
+- `SELL` открывает `SHORT`, если есть нисходящий импульс, объем и подтверждение по тренду;
+- противоположный сигнал может закрыть текущую позицию;
+- отдельно работают закрытия по `stop-loss` и `take-profit`.
 
-Сигналы:
+После открытия бот пытается поставить:
 
-- `BUY` открывает `LONG`, если есть сильное движение вверх, объем выше среднего, цена выше EMA и RSI сильный, но не перегретый.
-- `SELL` открывает `SHORT`, если есть сильное движение вниз, объем выше среднего, цена ниже EMA и RSI слабый.
-- Если уже открыта позиция, противоположный сигнал закрывает позицию reduce-only ордером.
-- Stop-loss и take-profit закрывают позицию отдельно для LONG и SHORT.
-- После открытия позиции бот ставит на Binance защитные `STOP_MARKET` и `TAKE_PROFIT_MARKET` ордера с `closePosition=true`.
+- `STOP_MARKET`;
+- `TAKE_PROFIT_MARKET`;
+- с `closePosition=true`.
 
-Бот рассчитан на One-way position mode. При `ENSURE_ONE_WAY_MODE=true` он пытается переключить аккаунт в One-way перед запуском.
+## Фильтры качества
+
+### Higher timeframe
+
+Если `HIGHER_TIMEFRAME_ENABLED=true`, вход разрешается только когда старший ТФ подтверждает направление:
+
+- для `LONG`: `HTF close > HTF EMA fast > HTF EMA slow`
+- для `SHORT`: `HTF close < HTF EMA fast < HTF EMA slow`
+
+Основные настройки:
+
+```env
+HIGHER_TIMEFRAME_ENABLED=true
+HIGHER_TIMEFRAME_INTERVAL=1h
+HIGHER_TIMEFRAME_EMA_FAST=9
+HIGHER_TIMEFRAME_EMA_SLOW=21
+```
+
+### Funding filter
+
+Если `FUNDING_FILTER_ENABLED=true`, бот режет входы с дорогим funding:
+
+- `LONG` блокируется, если `funding > MAX_LONG_FUNDING_RATE_PCT`
+- `SHORT` блокируется, если `funding < MIN_SHORT_FUNDING_RATE_PCT`
+
+Пример:
+
+```env
+FUNDING_FILTER_ENABLED=true
+MAX_LONG_FUNDING_RATE_PCT=0.03
+MIN_SHORT_FUNDING_RATE_PCT=-0.03
+```
+
+Значения здесь в процентах за funding-period.  
+Например `0.03` означает `0.03%`.
 
 ## Риск
 
-`TRADE_RISK_PCT` трактуется как максимальный риск от депозита при достижении `STOP_LOSS_PCT`. Размер позиции дополнительно ограничивается:
+Размер позиции ограничивается одновременно:
 
+- `TRADE_RISK_PCT`;
+- `STOP_LOSS_PCT`;
 - `LEVERAGE`;
 - `MIN_MARGIN_USDT`;
 - `MAX_MARGIN_USDT`;
-- минимальным notional биржи;
+- минимальным `notional` биржи;
 - `MAX_OPEN_POSITIONS`;
 - `MAX_TRADES_PER_CYCLE`.
 
-По умолчанию реальные ордера выключены.
+Дополнительно есть risk-контур:
+
+- `MAX_DAILY_LOSS_USDT`;
+- `MAX_CONSECUTIVE_LOSSES`;
+- `SYMBOL_COOLDOWN_MINUTES_AFTER_STOP`;
+- `SYMBOL_COOLDOWN_MINUTES_AFTER_CLOSE`.
+
+Если лимит достигнут, бот перестает открывать новые позиции, но все еще может закрывать старые.
+
+## Хранилище
+
+Основное хранилище — `SQLite`.
+
+Примеры:
+
+- `bot.sqlite3`
+- `bot_test.sqlite3`
+- `bot_work.sqlite3`
+
+Legacy-файлы:
+
+- `TRADE_LOG_FILE`
+- `POSITIONS_FILE`
+- `RISK_STATE_FILE`
+
+нужны только для:
+
+- lazy-миграции старых данных в SQLite;
+- fallback-режима `trade_stats.py`, если базы еще нет.
 
 ## Установка
 
@@ -48,104 +142,167 @@ pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-В `.env` вставь API ключи demo futures.
+В `.env` нужно вставить ключи Binance Demo Futures.
 
-## Первый безопасный запуск
+## Профили
 
-Сначала можно оставить:
+Ключи лежат в `.env`, а торговые профили вынесены отдельно:
 
-```text
-LIVE_TRADING=false
+- [.env.work](d:/zhandos998/Desktop/binance_py/.env.work) — более спокойный demo-профиль;
+- [.env.test](d:/zhandos998/Desktop/binance_py/.env.test) — агрессивный профиль для проверки механики входа/выхода.
+
+Пример storage-настроек:
+
+```env
+DATABASE_FILE=bot_work.sqlite3
+TRADE_LOG_FILE=futures_trades_work.csv
+POSITIONS_FILE=futures_positions_work.json
+RISK_STATE_FILE=risk_state_work.json
 ```
 
-Запуск:
+## Запуск
 
-```powershell
-py bot.py
-```
-
-## Профили настроек
-
-API ключи остаются в `.env`. Для стратегии есть отдельные профили без ключей:
-
-- `.env.work` - более спокойный рабочий demo-профиль на `15m`.
-- `.env.test` - агрессивный demo-профиль на `1m`, чтобы быстрее проверить входы, SL/TP и закрытие.
-
-Запуск тестового профиля:
-
-```powershell
-$env:BOT_PROFILE_FILE=".env.test"
-py bot.py
-```
-
-Запуск рабочего профиля:
+Рабочий профиль:
 
 ```powershell
 $env:BOT_PROFILE_FILE=".env.work"
 py bot.py
 ```
 
-Сброс выбранного профиля:
+Тестовый профиль:
+
+```powershell
+$env:BOT_PROFILE_FILE=".env.test"
+py bot.py
+```
+
+Сброс профиля:
 
 ```powershell
 Remove-Item Env:BOT_PROFILE_FILE
 ```
 
-В `.env.test` специально ослаблены фильтры:
+Для demo-исполнения ордеров:
 
-```text
-MOVEMENT_THRESHOLD_PCT=0.01
-MIN_VOLUME_RATIO=0.05
-REQUIRE_EMA_TREND=false
-BUY_RSI_MIN=0
-BUY_RSI_MAX=100
-SELL_RSI_MAX=100
-MAX_OPEN_POSITIONS=1
-MAX_TRADES_PER_CYCLE=1
-MAX_MARGIN_USDT=3
-STOP_LOSS_PCT=0.3
-TAKE_PROFIT_PCT=0.5
-```
-
-Этот профиль нужен только для проверки механики покупки/продажи на demo futures, не для нормальной торговли.
-
-В этом режиме бот только симулирует сделки и пишет:
-
-- `bot.log`;
-- `futures_trades.csv`;
-- `futures_positions.json`.
-
-## Demo Futures исполнение
-
-Для отправки ордеров в Binance Demo Trading USDT-M Futures:
-
-```text
+```env
 LIVE_TRADING=true
 FUTURES_DEMO=true
 FUTURES_BASE_URL=https://demo-fapi.binance.com/fapi
 USE_TEST_ORDER=false
 ```
 
-Для первого demo-запуска лучше ограничить рынок:
+Для безопасного dry-run:
 
-```text
-MAX_SYMBOLS=20
-SYMBOL_SELECTION=volume
-LOG_SCANNED_SYMBOLS=true
-LOG_SCAN_SUMMARY=true
-SCAN_SUMMARY_TOP_N=8
-LOG_SYMBOL_DECISIONS=false
-MAX_TRADES_PER_CYCLE=1
-MAX_OPEN_POSITIONS=2
-LEVERAGE=2
-MAX_MARGIN_USDT=5
-PLACE_PROTECTION_ORDERS=true
-PROTECTION_WORKING_TYPE=MARK_PRICE
-PROTECTION_TRIGGER_BUFFER_PCT=0.20
+```env
+LIVE_TRADING=false
 ```
 
-После этого:
+## Логи и состояния
+
+Бот пишет:
+
+- `bot.log` / `bot_*.log`;
+- `bot.sqlite3` / `bot_*.sqlite3`;
+- при наличии старых файлов может один раз импортировать `futures_trades*.csv`, `futures_positions*.json`, `risk_state*.json`.
+
+Если включены:
+
+- `LOG_SCANNED_SYMBOLS=true` — логируется universe;
+- `LOG_SCAN_SUMMARY=true` — логируется summary по скану;
+- `LOG_SYMBOL_DECISIONS=true` — логируется подробное решение по каждой монете.
+
+## Статистика по сделкам
+
+По умолчанию `trade_stats.py` читает `DATABASE_FILE` активного профиля.
 
 ```powershell
-py bot.py
+py trade_stats.py
 ```
+
+Для рабочего профиля:
+
+```powershell
+$env:BOT_PROFILE_FILE=".env.work"
+py trade_stats.py
+```
+
+Явно по SQLite:
+
+```powershell
+py trade_stats.py --db bot_work.sqlite3 --top 5 --days 10
+```
+
+Legacy CSV по-прежнему можно открыть напрямую:
+
+```powershell
+py trade_stats.py --file futures_trades_work.csv --top 5 --days 10
+```
+
+Скрипт считает:
+
+- `winrate`;
+- `avg win / avg loss`;
+- `profit factor`;
+- `expectancy`;
+- `max drawdown`.
+
+## Backtest / Walk-forward
+
+```powershell
+$env:BOT_PROFILE_FILE=".env.work"
+py backtest.py --symbols BTCUSDT,ETHUSDT --days 30 --walk-forward --train-bars 300 --test-bars 100
+```
+
+С сохранением simulated trades:
+
+```powershell
+py backtest.py --symbols BTCUSDT,ETHUSDT,SOLUSDT --days 60 --save-trades backtest_trades.csv
+```
+
+Backtest использует ту же логику:
+
+- momentum/EMA/RSI/volume;
+- higher timeframe filter;
+- funding-rate filter;
+- стоп/тейк внутри свечи;
+- комиссии и slippage.
+
+## Тесты
+
+Быстрый compile-check:
+
+```powershell
+py -m py_compile bot.py bot_base.py bot_exchange.py bot_execution.py bot_market.py bot_math.py bot_reporting.py bot_risk.py bot_scan.py bot_state.py bot_storage.py bot_strategy.py backtest.py trade_stats.py
+```
+
+Unit-тесты:
+
+```powershell
+py -m unittest discover -s tests -v
+```
+
+Обычный dev-запуск через `pytest`:
+
+```powershell
+pip install -r requirements-dev.txt
+pytest -q
+```
+
+## CI
+
+Есть workflow GitHub Actions: [.github/workflows/tests.yml](d:/zhandos998/Desktop/binance_py/.github/workflows/tests.yml)
+
+Он делает:
+
+1. установку `requirements-dev.txt`;
+2. `py_compile`;
+3. `pytest -q`.
+
+## Что дальше
+
+Практичные следующие шаги:
+
+1. Telegram-уведомления по входам, выходам и ошибкам;
+2. richer reporting поверх SQLite;
+3. ATR-based stop и фильтр режима рынка;
+4. dashboard по PnL, risk и execution quality.
