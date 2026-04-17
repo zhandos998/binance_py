@@ -63,7 +63,7 @@ def append_trade_log(
         {
             "timestamp": utc_now(),
             "mode": "реальный" if config.live_trading else "симуляция",
-            "market": "USDT-M Futures",
+            "market": f"{config.futures_quote_asset}-M Futures",
             "symbol": signal.symbol,
             "action": signal.action,
             "side": signal.side,
@@ -294,10 +294,12 @@ def fetch_external_close_event(client: Client, config: Config, position: Positio
             remaining_qty,
         )
 
+    quote_asset = config.futures_quote_asset.strip().upper() or "USDT"
+    base_asset = position.symbol.removesuffix(quote_asset) if position.symbol.endswith(quote_asset) else position.symbol
     symbol_meta = SymbolMeta(
         symbol=position.symbol,
-        base_asset=position.symbol.removesuffix("USDT"),
-        quote_asset="USDT",
+        base_asset=base_asset,
+        quote_asset=quote_asset,
         min_qty=Decimal("0"),
         step_size=Decimal("0"),
         min_notional=Decimal("0"),

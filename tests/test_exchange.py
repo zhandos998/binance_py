@@ -3,7 +3,13 @@ from __future__ import annotations
 import unittest
 from decimal import Decimal
 
-from bot_exchange import futures_symbol_rejection_reason, get_usdt_futures_symbols, market_entry_passes_percent_filter
+from bot_exchange import (
+    futures_available_quote_balance,
+    futures_symbol_rejection_reason,
+    get_futures_symbols,
+    get_usdt_futures_symbols,
+    market_entry_passes_percent_filter,
+)
 from tests.support import make_config
 
 
@@ -66,6 +72,21 @@ class FakeExchangeClient:
                     "quantityPrecision": 0,
                     "filters": [],
                 },
+                {
+                    "symbol": "BTCUSDC",
+                    "baseAsset": "BTC",
+                    "quoteAsset": "USDC",
+                    "marginAsset": "USDC",
+                    "status": "TRADING",
+                    "contractType": "PERPETUAL",
+                    "quantityPrecision": 3,
+                    "filters": [
+                        {"filterType": "MARKET_LOT_SIZE", "minQty": "0.001", "stepSize": "0.001"},
+                        {"filterType": "MIN_NOTIONAL", "notional": "5"},
+                        {"filterType": "PRICE_FILTER", "tickSize": "0.1"},
+                        {"filterType": "PERCENT_PRICE", "multiplierUp": "1.05", "multiplierDown": "0.95"},
+                    ],
+                },
             ]
         }
 
@@ -75,6 +96,13 @@ class FakeExchangeClient:
             {"symbol": "ETHUSDT", "quoteVolume": "2000"},
             {"symbol": "BTCUSDT", "quoteVolume": "3000"},
             {"symbol": "USDCUSDT", "quoteVolume": "9000"},
+            {"symbol": "BTCUSDC", "quoteVolume": "7000"},
+        ]
+
+    def futures_account_balance(self) -> list[dict[str, str]]:
+        return [
+            {"asset": "USDT", "availableBalance": "125.5"},
+            {"asset": "USDC", "availableBalance": "88.25"},
         ]
 
     def futures_mark_price(self, symbol: str | None = None) -> dict[str, str]:
@@ -118,6 +146,26 @@ class ExchangeTests(unittest.TestCase):
         symbols = get_usdt_futures_symbols(FakeExchangeClient(), config)
 
         self.assertEqual(list(symbols), ["ETHUSDT", "FUNUSDT"])
+
+    def test_get_futures_symbols_supports_usdc_profile(self) -> None:
+        config = make_config(
+            futures_quote_asset="USDC",
+            max_symbols=5,
+            symbol_selection="volume",
+            log_scanned_symbols=False,
+        )
+
+        symbols = get_futures_symbols(FakeExchangeClient(), config)
+
+        self.assertEqual(list(symbols), ["BTCUSDC"])
+        self.assertEqual(symbols["BTCUSDC"].quote_asset, "USDC")
+
+    def test_futures_available_quote_balance_reads_configured_asset(self) -> None:
+        config = make_config(futures_quote_asset="USDC", live_trading=True)
+
+        balance = futures_available_quote_balance(FakeExchangeClient(), config)
+
+        self.assertEqual(balance, Decimal("88.25"))
 
     def test_market_entry_passes_percent_filter_rejects_wide_spread(self) -> None:
         client = FakeExchangeClient()

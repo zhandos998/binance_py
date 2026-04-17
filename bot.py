@@ -28,7 +28,7 @@ from bot_base import (
     create_client,
     load_config,
 )
-from bot_exchange import get_usdt_futures_symbols, log_symbol_chunks
+from bot_exchange import get_futures_symbols, log_symbol_chunks
 from bot_execution import (
     ensure_one_way_position_mode,
     place_close_order,
@@ -120,7 +120,7 @@ def main() -> None:
 
     mode = "РЕАЛЬНЫЙ" if config.live_trading else "СИМУЛЯЦИЯ"
     endpoint = config.futures_base_url if config.futures_base_url else "live futures endpoint"
-    logging.info("Запуск Binance USDT-M Futures бота. Режим: %s. Endpoint: %s", mode, endpoint)
+    logging.info("Запуск Binance %s-M Futures бота. Режим: %s. Endpoint: %s", config.futures_quote_asset, mode, endpoint)
     logging.info(
         "Профиль настроек: %s%s",
         config.env_profile_name,
@@ -132,10 +132,10 @@ def main() -> None:
     client = create_client(config)
     ensure_one_way_position_mode(client, config)
 
-    symbols = get_usdt_futures_symbols(client, config)
+    symbols = get_futures_symbols(client, config)
     risk_state = load_risk_state(config)
     positions = sync_live_positions(client, config, symbols, risk_state) if config.live_trading else load_positions(config)
-    logging.info("Загружено активных USDT-M perpetual символов: %s.", len(symbols))
+    logging.info("Загружено активных %s-M perpetual символов: %s.", config.futures_quote_asset, len(symbols))
     block_reason = openings_blocked_reason(config, risk_state)
     logging.info(
         "Риск-контур: дневной PnL=%s USDT, серия убытков=%s, активных cooldown=%s.",
@@ -160,8 +160,8 @@ def main() -> None:
     while not stop_requested["value"]:
         cycle += 1
         if cycle % 30 == 0:
-            symbols = get_usdt_futures_symbols(client, config)
-            logging.info("Обновлен список futures-символов USDT: %s.", len(symbols))
+            symbols = get_futures_symbols(client, config)
+            logging.info("Обновлен список futures-символов %s: %s.", config.futures_quote_asset, len(symbols))
 
         try:
             execute_cycle(client, config, symbols, positions, risk_state)

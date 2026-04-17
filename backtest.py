@@ -16,7 +16,7 @@ from typing import Any
 from binance.client import Client
 
 from bot_base import CLOSE_LONG, CLOSE_SHORT, LONG, Config, MarketSnapshot, OrderSize, Position, SymbolMeta, TradeSignal, load_config
-from bot_exchange import get_usdt_futures_symbols
+from bot_exchange import get_futures_symbols
 from bot_market import build_snapshot, minimum_required_bars
 from bot_math import round_step
 from bot_risk import (
@@ -819,7 +819,7 @@ def main() -> None:
 
     config = load_config()
     client = live_market_data_client()
-    symbols_map = get_usdt_futures_symbols(client, config)
+    symbols_map = get_futures_symbols(client, config)
 
     explicit_symbols = [item.strip().upper() for item in args.symbols.split(",") if item.strip()]
     if explicit_symbols:

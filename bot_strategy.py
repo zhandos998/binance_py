@@ -16,6 +16,9 @@ from bot_base import (
     TradeSignal,
 )
 
+MOMENTUM_STRATEGY = "momentum"
+TREND_PULLBACK_STRATEGY = "trend_pullback"
+
 
 def ema(values: list[float], period: int) -> list[float]:
     if not values:
@@ -124,7 +127,49 @@ def higher_timeframe_state(snapshot: MarketSnapshot) -> str:
     return "MIXED"
 
 
-def build_open_signal(snapshot: MarketSnapshot, config: Config) -> TradeSignal | None:
+def strategy_mode(config: Config) -> str:
+    if config.strategy_mode == TREND_PULLBACK_STRATEGY:
+        return TREND_PULLBACK_STRATEGY
+    return MOMENTUM_STRATEGY
+
+
+def pullback_trend_limit(config: Config) -> float:
+    return max(config.movement_threshold_pct * 0.75, 0.15)
+
+
+def pullback_counter_limit(config: Config) -> float:
+    return max(config.movement_threshold_pct * 0.35, 0.10)
+
+
+def pullback_volume_threshold(config: Config) -> float:
+    if config.min_volume_ratio <= 0.8:
+        return config.min_volume_ratio
+    return config.min_volume_ratio * 0.8
+
+
+def normalized_rsi_range(lower: float, upper: float) -> tuple[float, float]:
+    lower = max(0.0, min(lower, 100.0))
+    upper = max(0.0, min(upper, 100.0))
+    if lower > upper:
+        lower = upper
+    return lower, upper
+
+
+def long_pullback_rsi_range(config: Config) -> tuple[float, float]:
+    center = min(max(config.buy_rsi_min + 4.0, 44.0), 58.0)
+    lower = max(35.0, center - 8.0)
+    upper = min(68.0, center + 8.0, config.buy_rsi_max)
+    return normalized_rsi_range(lower, upper)
+
+
+def short_pullback_rsi_range(config: Config) -> tuple[float, float]:
+    center = min(max(config.sell_rsi_max + 6.0, 42.0), 56.0)
+    lower = max(35.0, center - 8.0)
+    upper = min(65.0, center + 8.0)
+    return normalized_rsi_range(lower, upper)
+
+
+def build_momentum_open_signal(snapshot: MarketSnapshot, config: Config) -> TradeSignal | None:
     long_trend_ok = trend_up(snapshot) or not config.require_ema_trend
     short_trend_ok = trend_down(snapshot) or not config.require_ema_trend
     volume_ok = snapshot.volume_ratio >= config.min_volume_ratio
@@ -143,7 +188,7 @@ def build_open_signal(snapshot: MarketSnapshot, config: Config) -> TradeSignal |
     ):
         score = snapshot.pct_change + snapshot.volume_ratio + ((snapshot.rsi - 50) / 10)
         reason = (
-            f"импульс вверх {snapshot.pct_change:.2f}%, "
+            f"Импульс вверх {snapshot.pct_change:.2f}%, "
             f"RSI={snapshot.rsi:.1f}, объем/средний={snapshot.volume_ratio:.2f}, "
             f"EMA тренд вверх, HTF={higher_timeframe_state(snapshot)}, {funding_text(snapshot)}"
         )
@@ -159,13 +204,68 @@ def build_open_signal(snapshot: MarketSnapshot, config: Config) -> TradeSignal |
     ):
         score = abs(snapshot.pct_change) + snapshot.volume_ratio + ((50 - snapshot.rsi) / 10)
         reason = (
-            f"импульс вниз {snapshot.pct_change:.2f}%, "
+            f"Импульс вниз {snapshot.pct_change:.2f}%, "
             f"RSI={snapshot.rsi:.1f}, объем/средний={snapshot.volume_ratio:.2f}, "
             f"EMA тренд вниз, HTF={higher_timeframe_state(snapshot)}, {funding_text(snapshot)}"
         )
         return TradeSignal(snapshot.symbol, OPEN_SHORT, "SELL", SHORT, score, snapshot.close, reason)
 
     return None
+
+
+def build_trend_pullback_open_signal(snapshot: MarketSnapshot, config: Config) -> TradeSignal | None:
+    long_trend_ok = trend_up(snapshot) or not config.require_ema_trend
+    short_trend_ok = trend_down(snapshot) or not config.require_ema_trend
+    long_higher_ok = higher_timeframe_ok(snapshot, config, LONG)
+    short_higher_ok = higher_timeframe_ok(snapshot, config, SHORT)
+    long_funding_allowed = funding_ok(snapshot, config, LONG)
+    short_funding_allowed = funding_ok(snapshot, config, SHORT)
+    volume_threshold = pullback_volume_threshold(config)
+    volume_ok = snapshot.volume_ratio >= volume_threshold
+    trend_limit = pullback_trend_limit(config)
+    counter_limit = pullback_counter_limit(config)
+    long_rsi_min, long_rsi_max = long_pullback_rsi_range(config)
+    short_rsi_min, short_rsi_max = short_pullback_rsi_range(config)
+
+    if (
+        -counter_limit <= snapshot.pct_change <= trend_limit
+        and long_trend_ok
+        and volume_ok
+        and long_higher_ok
+        and long_funding_allowed
+        and long_rsi_min <= snapshot.rsi <= long_rsi_max
+    ):
+        score = snapshot.volume_ratio + max(0.0, trend_limit - abs(snapshot.pct_change)) + ((64 - abs(snapshot.rsi - 52.0)) / 10)
+        reason = (
+            f"Пуллбек к восходящему тренду {snapshot.pct_change:.2f}%, "
+            f"RSI={snapshot.rsi:.1f}, объем/средний={snapshot.volume_ratio:.2f}, "
+            f"EMA тренд вверх, HTF={higher_timeframe_state(snapshot)}, {funding_text(snapshot)}"
+        )
+        return TradeSignal(snapshot.symbol, OPEN_LONG, "BUY", LONG, score, snapshot.close, reason)
+
+    if (
+        -trend_limit <= snapshot.pct_change <= counter_limit
+        and short_trend_ok
+        and volume_ok
+        and short_higher_ok
+        and short_funding_allowed
+        and short_rsi_min <= snapshot.rsi <= short_rsi_max
+    ):
+        score = snapshot.volume_ratio + max(0.0, trend_limit - abs(snapshot.pct_change)) + ((64 - abs(snapshot.rsi - 48.0)) / 10)
+        reason = (
+            f"Пуллбек к нисходящему тренду {snapshot.pct_change:.2f}%, "
+            f"RSI={snapshot.rsi:.1f}, объем/средний={snapshot.volume_ratio:.2f}, "
+            f"EMA тренд вниз, HTF={higher_timeframe_state(snapshot)}, {funding_text(snapshot)}"
+        )
+        return TradeSignal(snapshot.symbol, OPEN_SHORT, "SELL", SHORT, score, snapshot.close, reason)
+
+    return None
+
+
+def build_open_signal(snapshot: MarketSnapshot, config: Config) -> TradeSignal | None:
+    if strategy_mode(config) == TREND_PULLBACK_STRATEGY:
+        return build_trend_pullback_open_signal(snapshot, config)
+    return build_momentum_open_signal(snapshot, config)
 
 
 def format_market_metrics(snapshot: MarketSnapshot) -> str:
@@ -180,46 +280,109 @@ def format_market_metrics(snapshot: MarketSnapshot) -> str:
     )
 
 
-def explain_no_open_signal(snapshot: MarketSnapshot, config: Config) -> str:
+def momentum_explain_blockers(snapshot: MarketSnapshot, config: Config, direction: str) -> list[str]:
     volume_ok = snapshot.volume_ratio >= config.min_volume_ratio
+    blockers: list[str] = []
 
-    long_blockers: list[str] = []
-    if snapshot.pct_change < config.movement_threshold_pct:
-        long_blockers.append(f"рост {snapshot.pct_change:.2f}% < порога {config.movement_threshold_pct:.2f}%")
-    if config.require_ema_trend and not trend_up(snapshot):
-        long_blockers.append("нет EMA-тренда вверх")
-    if config.higher_timeframe_enabled and not higher_timeframe_trend_up(snapshot):
-        long_blockers.append(f"нет HTF-тренда вверх ({config.higher_timeframe_interval})")
-    if not volume_ok:
-        long_blockers.append(f"объем {snapshot.volume_ratio:.2f} < порога {config.min_volume_ratio:.2f}")
-    if not (config.buy_rsi_min <= snapshot.rsi <= config.buy_rsi_max):
-        long_blockers.append(f"RSI {snapshot.rsi:.1f} вне диапазона LONG {config.buy_rsi_min:.1f}-{config.buy_rsi_max:.1f}")
-    if config.funding_filter_enabled and not long_funding_ok(snapshot, config):
-        if snapshot.funding_rate_pct is None:
-            long_blockers.append("funding недоступен")
-        else:
-            long_blockers.append(
-                f"funding {snapshot.funding_rate_pct:.4f}% выше LONG-порога {config.max_long_funding_rate_pct:.4f}%"
-            )
+    if direction == LONG:
+        if snapshot.pct_change < config.movement_threshold_pct:
+            blockers.append(f"рост {snapshot.pct_change:.2f}% < порога {config.movement_threshold_pct:.2f}%")
+        if config.require_ema_trend and not trend_up(snapshot):
+            blockers.append("нет EMA-тренда вверх")
+        if config.higher_timeframe_enabled and not higher_timeframe_trend_up(snapshot):
+            blockers.append(f"нет HTF-тренда вверх ({config.higher_timeframe_interval})")
+        if not volume_ok:
+            blockers.append(f"объем {snapshot.volume_ratio:.2f} < порога {config.min_volume_ratio:.2f}")
+        if not (config.buy_rsi_min <= snapshot.rsi <= config.buy_rsi_max):
+            blockers.append(f"RSI {snapshot.rsi:.1f} вне диапазона LONG {config.buy_rsi_min:.1f}-{config.buy_rsi_max:.1f}")
+        if config.funding_filter_enabled and not long_funding_ok(snapshot, config):
+            if snapshot.funding_rate_pct is None:
+                blockers.append("funding недоступен")
+            else:
+                blockers.append(
+                    f"funding {snapshot.funding_rate_pct:.4f}% выше LONG-порога {config.max_long_funding_rate_pct:.4f}%"
+                )
+        return blockers
 
-    short_blockers: list[str] = []
     if snapshot.pct_change > -config.movement_threshold_pct:
-        short_blockers.append(f"падение {snapshot.pct_change:.2f}% слабее порога -{config.movement_threshold_pct:.2f}%")
+        blockers.append(f"падение {snapshot.pct_change:.2f}% слабее порога -{config.movement_threshold_pct:.2f}%")
     if config.require_ema_trend and not trend_down(snapshot):
-        short_blockers.append("нет EMA-тренда вниз")
+        blockers.append("нет EMA-тренда вниз")
     if config.higher_timeframe_enabled and not higher_timeframe_trend_down(snapshot):
-        short_blockers.append(f"нет HTF-тренда вниз ({config.higher_timeframe_interval})")
+        blockers.append(f"нет HTF-тренда вниз ({config.higher_timeframe_interval})")
     if not volume_ok:
-        short_blockers.append(f"объем {snapshot.volume_ratio:.2f} < порога {config.min_volume_ratio:.2f}")
+        blockers.append(f"объем {snapshot.volume_ratio:.2f} < порога {config.min_volume_ratio:.2f}")
     if snapshot.rsi > config.sell_rsi_max:
-        short_blockers.append(f"RSI {snapshot.rsi:.1f} выше SHORT-порога {config.sell_rsi_max:.1f}")
+        blockers.append(f"RSI {snapshot.rsi:.1f} выше SHORT-порога {config.sell_rsi_max:.1f}")
     if config.funding_filter_enabled and not short_funding_ok(snapshot, config):
         if snapshot.funding_rate_pct is None:
-            short_blockers.append("funding недоступен")
+            blockers.append("funding недоступен")
         else:
-            short_blockers.append(
+            blockers.append(
                 f"funding {snapshot.funding_rate_pct:.4f}% ниже SHORT-порога {config.min_short_funding_rate_pct:.4f}%"
             )
+    return blockers
+
+
+def trend_pullback_explain_blockers(snapshot: MarketSnapshot, config: Config, direction: str) -> list[str]:
+    volume_threshold = pullback_volume_threshold(config)
+    trend_limit = pullback_trend_limit(config)
+    counter_limit = pullback_counter_limit(config)
+    long_rsi_min, long_rsi_max = long_pullback_rsi_range(config)
+    short_rsi_min, short_rsi_max = short_pullback_rsi_range(config)
+    blockers: list[str] = []
+
+    if direction == LONG:
+        if snapshot.pct_change < -counter_limit or snapshot.pct_change > trend_limit:
+            blockers.append(
+                f"пуллбек LONG вне окна {snapshot.pct_change:.2f}% (нужно от -{counter_limit:.2f}% до {trend_limit:.2f}%)"
+            )
+        if config.require_ema_trend and not trend_up(snapshot):
+            blockers.append("нет EMA-тренда вверх")
+        if config.higher_timeframe_enabled and not higher_timeframe_trend_up(snapshot):
+            blockers.append(f"нет HTF-тренда вверх ({config.higher_timeframe_interval})")
+        if snapshot.volume_ratio < volume_threshold:
+            blockers.append(f"объем {snapshot.volume_ratio:.2f} < pullback-порога {volume_threshold:.2f}")
+        if not (long_rsi_min <= snapshot.rsi <= long_rsi_max):
+            blockers.append(f"RSI {snapshot.rsi:.1f} вне окна LONG-pullback {long_rsi_min:.1f}-{long_rsi_max:.1f}")
+        if config.funding_filter_enabled and not long_funding_ok(snapshot, config):
+            if snapshot.funding_rate_pct is None:
+                blockers.append("funding недоступен")
+            else:
+                blockers.append(
+                    f"funding {snapshot.funding_rate_pct:.4f}% выше LONG-порога {config.max_long_funding_rate_pct:.4f}%"
+                )
+        return blockers
+
+    if snapshot.pct_change < -trend_limit or snapshot.pct_change > counter_limit:
+        blockers.append(
+            f"пуллбек SHORT вне окна {snapshot.pct_change:.2f}% (нужно от -{trend_limit:.2f}% до {counter_limit:.2f}%)"
+        )
+    if config.require_ema_trend and not trend_down(snapshot):
+        blockers.append("нет EMA-тренда вниз")
+    if config.higher_timeframe_enabled and not higher_timeframe_trend_down(snapshot):
+        blockers.append(f"нет HTF-тренда вниз ({config.higher_timeframe_interval})")
+    if snapshot.volume_ratio < volume_threshold:
+        blockers.append(f"объем {snapshot.volume_ratio:.2f} < pullback-порога {volume_threshold:.2f}")
+    if not (short_rsi_min <= snapshot.rsi <= short_rsi_max):
+        blockers.append(f"RSI {snapshot.rsi:.1f} вне окна SHORT-pullback {short_rsi_min:.1f}-{short_rsi_max:.1f}")
+    if config.funding_filter_enabled and not short_funding_ok(snapshot, config):
+        if snapshot.funding_rate_pct is None:
+            blockers.append("funding недоступен")
+        else:
+            blockers.append(
+                f"funding {snapshot.funding_rate_pct:.4f}% ниже SHORT-порога {config.min_short_funding_rate_pct:.4f}%"
+            )
+    return blockers
+
+
+def explain_no_open_signal(snapshot: MarketSnapshot, config: Config) -> str:
+    if strategy_mode(config) == TREND_PULLBACK_STRATEGY:
+        long_blockers = trend_pullback_explain_blockers(snapshot, config, LONG)
+        short_blockers = trend_pullback_explain_blockers(snapshot, config, SHORT)
+    else:
+        long_blockers = momentum_explain_blockers(snapshot, config, LONG)
+        short_blockers = momentum_explain_blockers(snapshot, config, SHORT)
 
     long_text = "; ".join(long_blockers) if long_blockers else "условия LONG выполнены"
     short_text = "; ".join(short_blockers) if short_blockers else "условия SHORT выполнены"
@@ -242,7 +405,7 @@ def ema_state(snapshot: MarketSnapshot) -> str:
     return "MIXED"
 
 
-def signal_blockers(snapshot: MarketSnapshot, config: Config, direction: str) -> tuple[str, ...]:
+def momentum_signal_blockers(snapshot: MarketSnapshot, config: Config, direction: str) -> tuple[str, ...]:
     volume_ok = snapshot.volume_ratio >= config.min_volume_ratio
     blockers: list[str] = []
 
@@ -259,21 +422,65 @@ def signal_blockers(snapshot: MarketSnapshot, config: Config, direction: str) ->
             blockers.append("RSI")
         if config.funding_filter_enabled and not long_funding_ok(snapshot, config):
             blockers.append("funding")
-    else:
-        if snapshot.pct_change > -config.movement_threshold_pct:
-            blockers.append("движение")
-        if config.require_ema_trend and not trend_down(snapshot):
-            blockers.append("EMA")
-        if config.higher_timeframe_enabled and not higher_timeframe_trend_down(snapshot):
-            blockers.append("HTF")
-        if not volume_ok:
-            blockers.append("объем")
-        if snapshot.rsi > config.sell_rsi_max:
-            blockers.append("RSI")
-        if config.funding_filter_enabled and not short_funding_ok(snapshot, config):
-            blockers.append("funding")
+        return tuple(blockers)
 
+    if snapshot.pct_change > -config.movement_threshold_pct:
+        blockers.append("движение")
+    if config.require_ema_trend and not trend_down(snapshot):
+        blockers.append("EMA")
+    if config.higher_timeframe_enabled and not higher_timeframe_trend_down(snapshot):
+        blockers.append("HTF")
+    if not volume_ok:
+        blockers.append("объем")
+    if snapshot.rsi > config.sell_rsi_max:
+        blockers.append("RSI")
+    if config.funding_filter_enabled and not short_funding_ok(snapshot, config):
+        blockers.append("funding")
     return tuple(blockers)
+
+
+def trend_pullback_signal_blockers(snapshot: MarketSnapshot, config: Config, direction: str) -> tuple[str, ...]:
+    volume_threshold = pullback_volume_threshold(config)
+    trend_limit = pullback_trend_limit(config)
+    counter_limit = pullback_counter_limit(config)
+    long_rsi_min, long_rsi_max = long_pullback_rsi_range(config)
+    short_rsi_min, short_rsi_max = short_pullback_rsi_range(config)
+    blockers: list[str] = []
+
+    if direction == LONG:
+        if snapshot.pct_change < -counter_limit or snapshot.pct_change > trend_limit:
+            blockers.append("движение")
+        if config.require_ema_trend and not trend_up(snapshot):
+            blockers.append("EMA")
+        if config.higher_timeframe_enabled and not higher_timeframe_trend_up(snapshot):
+            blockers.append("HTF")
+        if snapshot.volume_ratio < volume_threshold:
+            blockers.append("объем")
+        if not (long_rsi_min <= snapshot.rsi <= long_rsi_max):
+            blockers.append("RSI")
+        if config.funding_filter_enabled and not long_funding_ok(snapshot, config):
+            blockers.append("funding")
+        return tuple(blockers)
+
+    if snapshot.pct_change < -trend_limit or snapshot.pct_change > counter_limit:
+        blockers.append("движение")
+    if config.require_ema_trend and not trend_down(snapshot):
+        blockers.append("EMA")
+    if config.higher_timeframe_enabled and not higher_timeframe_trend_down(snapshot):
+        blockers.append("HTF")
+    if snapshot.volume_ratio < volume_threshold:
+        blockers.append("объем")
+    if not (short_rsi_min <= snapshot.rsi <= short_rsi_max):
+        blockers.append("RSI")
+    if config.funding_filter_enabled and not short_funding_ok(snapshot, config):
+        blockers.append("funding")
+    return tuple(blockers)
+
+
+def signal_blockers(snapshot: MarketSnapshot, config: Config, direction: str) -> tuple[str, ...]:
+    if strategy_mode(config) == TREND_PULLBACK_STRATEGY:
+        return trend_pullback_signal_blockers(snapshot, config, direction)
+    return momentum_signal_blockers(snapshot, config, direction)
 
 
 def choose_best_direction(snapshot: MarketSnapshot, config: Config) -> tuple[str, tuple[str, ...]]:

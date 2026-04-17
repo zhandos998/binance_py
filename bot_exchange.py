@@ -52,29 +52,34 @@ def get_percent_price_values(filters: list[dict[str, Any]]) -> tuple[Decimal, De
     return multiplier_up, multiplier_down
 
 
-def futures_symbol_rejection_reason(symbol_info: dict[str, Any]) -> str | None:
-    symbol = str(symbol_info.get("symbol", ""))
-    base_asset = str(symbol_info.get("baseAsset", ""))
+def configured_quote_asset(config: Config) -> str:
+    return config.futures_quote_asset.strip().upper() or "USDT"
+
+
+def futures_symbol_rejection_reason(symbol_info: dict[str, Any], quote_asset: str = "USDT") -> str | None:
+    symbol = str(symbol_info.get("symbol", "")).upper()
+    base_asset = str(symbol_info.get("baseAsset", "")).upper()
+    normalized_quote_asset = quote_asset.strip().upper() or "USDT"
 
     if symbol_info.get("status") != "TRADING":
         return "status не TRADING"
-    if symbol_info.get("quoteAsset") != "USDT":
-        return "quoteAsset не USDT"
-    if symbol_info.get("marginAsset") not in {None, "USDT"}:
-        return "marginAsset не USDT"
+    if str(symbol_info.get("quoteAsset", "")).upper() != normalized_quote_asset:
+        return f"quoteAsset не {normalized_quote_asset}"
+    if str(symbol_info.get("marginAsset", normalized_quote_asset)).upper() != normalized_quote_asset:
+        return f"marginAsset не {normalized_quote_asset}"
     if symbol_info.get("contractType") != "PERPETUAL":
         return "contractType не PERPETUAL"
     if base_asset in STABLE_BASE_ASSETS:
         return "baseAsset стейбл/фиат"
     if base_asset.endswith(EXCLUDED_BASE_SUFFIXES):
         return "токен с суффиксом UP/DOWN/BULL/BEAR"
-    if not symbol.endswith("USDT"):
-        return "symbol не заканчивается на USDT"
+    if not symbol.endswith(normalized_quote_asset):
+        return f"symbol не заканчивается на {normalized_quote_asset}"
     return None
 
 
 def is_supported_usdt_futures_symbol(symbol_info: dict[str, Any]) -> bool:
-    return futures_symbol_rejection_reason(symbol_info) is None
+    return futures_symbol_rejection_reason(symbol_info, "USDT") is None
 
 
 def get_futures_quote_volumes(client: Client) -> dict[str, Decimal]:
@@ -91,7 +96,7 @@ def get_futures_quote_volumes(client: Client) -> dict[str, Decimal]:
     for item in tickers:
         symbol = item.get("symbol")
         if symbol:
-            volumes[str(symbol)] = Decimal(str(item.get("quoteVolume", "0")))
+            volumes[str(symbol).upper()] = Decimal(str(item.get("quoteVolume", "0")))
     return volumes
 
 
@@ -115,15 +120,16 @@ def format_rejection_counts(rejection_counts: dict[str, int]) -> str:
     return "; ".join(f"{reason}: {count}" for reason, count in sorted(rejection_counts.items()))
 
 
-def get_usdt_futures_symbols(client: Client, config: Config) -> dict[str, SymbolMeta]:
+def get_futures_symbols(client: Client, config: Config) -> dict[str, SymbolMeta]:
     exchange_info = client.futures_exchange_info()
     symbols: dict[str, SymbolMeta] = {}
     rejection_counts: dict[str, int] = {}
     quote_volumes = get_futures_quote_volumes(client) if config.symbol_selection == "volume" else {}
     whitelist = set(config.symbol_whitelist)
+    quote_asset = configured_quote_asset(config)
 
     for item in exchange_info.get("symbols", []):
-        rejection_reason = futures_symbol_rejection_reason(item)
+        rejection_reason = futures_symbol_rejection_reason(item, quote_asset)
         if rejection_reason is not None:
             rejection_counts[rejection_reason] = rejection_counts.get(rejection_reason, 0) + 1
             continue
@@ -140,16 +146,16 @@ def get_usdt_futures_symbols(client: Client, config: Config) -> dict[str, Symbol
         percent_price_up, percent_price_down = get_percent_price_values(filters)
         quote_volume = quote_volumes.get(symbol, Decimal("0"))
         selection_reason = (
-            "активный USDT-M perpetual: status=TRADING, quoteAsset=USDT, "
-            "marginAsset=USDT, contractType=PERPETUAL"
+            f"активный {quote_asset}-M perpetual: status=TRADING, quoteAsset={quote_asset}, "
+            f"marginAsset={quote_asset}, contractType=PERPETUAL"
         )
         if whitelist:
             selection_reason += "; разрешен в SYMBOL_WHITELIST"
 
         symbols[symbol] = SymbolMeta(
             symbol=symbol,
-            base_asset=item["baseAsset"],
-            quote_asset=item["quoteAsset"],
+            base_asset=str(item["baseAsset"]).upper(),
+            quote_asset=str(item["quoteAsset"]).upper(),
             min_qty=min_qty,
             step_size=step_size,
             min_notional=min_notional,
@@ -181,7 +187,7 @@ def get_usdt_futures_symbols(client: Client, config: Config) -> dict[str, Symbol
         )
         logging.info(
             "Почему они сканируются: %s",
-            "status=TRADING, contractType=PERPETUAL, quoteAsset=USDT, marginAsset=USDT; "
+            f"status=TRADING, contractType=PERPETUAL, quoteAsset={quote_asset}, marginAsset={quote_asset}; "
             "исключены стейблкоины/фиат и UP/DOWN/BULL/BEAR токены.",
         )
         if whitelist:
@@ -195,15 +201,24 @@ def get_usdt_futures_symbols(client: Client, config: Config) -> dict[str, Symbol
     return ordered_symbols
 
 
-def futures_available_usdt(client: Client, config: Config) -> Decimal:
+def get_usdt_futures_symbols(client: Client, config: Config) -> dict[str, SymbolMeta]:
+    return get_futures_symbols(client, config)
+
+
+def futures_available_quote_balance(client: Client, config: Config) -> Decimal:
     if not config.live_trading:
         return config.dry_run_usdt_balance
 
+    quote_asset = configured_quote_asset(config)
     balances = client.futures_account_balance()
     for item in balances:
-        if item.get("asset") == "USDT":
+        if str(item.get("asset", "")).upper() == quote_asset:
             return Decimal(str(item.get("availableBalance", item.get("balance", "0"))))
     return Decimal("0")
+
+
+def futures_available_usdt(client: Client, config: Config) -> Decimal:
+    return futures_available_quote_balance(client, config)
 
 
 def get_entry_reference_prices(client: Client, symbol: str) -> tuple[Decimal, Decimal, Decimal]:

@@ -64,6 +64,7 @@ class Config:
     env_profile_name: str
     api_key: str
     api_secret: str
+    futures_quote_asset: str
     live_trading: bool
     use_test_order: bool
     futures_demo: bool
@@ -83,6 +84,7 @@ class Config:
     dry_run_usdt_balance: Decimal
     leverage: int
     margin_type: str
+    strategy_mode: str
     ema_fast: int
     ema_slow: int
     rsi_period: int
@@ -318,6 +320,7 @@ def load_environment() -> tuple[str, str]:
 
 def load_config() -> Config:
     env_profile_file, env_profile_name = load_environment()
+    futures_quote_asset = os.getenv("FUTURES_QUOTE_ASSET", "USDT").strip().upper() or "USDT"
 
     legacy_testnet = env_bool("SPOT_TESTNET", True)
     futures_demo = env_bool("FUTURES_DEMO", env_bool("FUTURES_TESTNET", legacy_testnet))
@@ -337,6 +340,9 @@ def load_config() -> Config:
     symbol_selection = os.getenv("SYMBOL_SELECTION", "volume").strip().lower()
     if symbol_selection not in {"volume", "alphabetical"}:
         symbol_selection = "volume"
+    strategy_mode = os.getenv("STRATEGY_MODE", "momentum").strip().lower()
+    if strategy_mode not in {"momentum", "trend_pullback"}:
+        strategy_mode = "momentum"
     higher_timeframe_interval = os.getenv("HIGHER_TIMEFRAME_INTERVAL", "1h").strip() or "1h"
 
     return Config(
@@ -344,6 +350,7 @@ def load_config() -> Config:
         env_profile_name=env_profile_name,
         api_key=os.getenv("BINANCE_API_KEY", "").strip(),
         api_secret=os.getenv("BINANCE_API_SECRET", "").strip(),
+        futures_quote_asset=futures_quote_asset,
         live_trading=env_bool("LIVE_TRADING", False),
         use_test_order=env_bool("USE_TEST_ORDER", False),
         futures_demo=futures_demo,
@@ -367,6 +374,7 @@ def load_config() -> Config:
         dry_run_usdt_balance=env_decimal("DRY_RUN_USDT_BALANCE", "1000"),
         leverage=env_int("LEVERAGE", 3, 1, 20),
         margin_type=margin_type,
+        strategy_mode=strategy_mode,
         ema_fast=env_int("EMA_FAST", 9, 2, None),
         ema_slow=env_int("EMA_SLOW", 21, 3, None),
         rsi_period=env_int("RSI_PERIOD", 14, 2, None),

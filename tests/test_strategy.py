@@ -84,6 +84,49 @@ class StrategyTests(unittest.TestCase):
         self.assertIsNone(signal)
         self.assertIn("HTF", signal_blockers(snapshot, config, SHORT))
 
+    def test_build_open_signal_returns_pullback_long_for_riskier_mode(self) -> None:
+        config = make_config(
+            strategy_mode="trend_pullback",
+            min_volume_ratio=1.2,
+            higher_timeframe_enabled=True,
+            funding_filter_enabled=True,
+        )
+        snapshot = MarketSnapshot(
+            symbol="SOLUSDT",
+            close=Decimal("105"),
+            pct_change=0.25,
+            rsi=54.0,
+            ema_fast=104.0,
+            ema_slow=103.0,
+            volume_ratio=1.0,
+            higher_timeframe_close=Decimal("110"),
+            higher_timeframe_ema_fast=108.0,
+            higher_timeframe_ema_slow=106.0,
+            funding_rate_pct=0.01,
+        )
+
+        signal = build_open_signal(snapshot, config)
+        self.assertIsNotNone(signal)
+        assert signal is not None
+        self.assertEqual(signal.direction, LONG)
+        self.assertEqual(signal.action, "OPEN_LONG")
+
+    def test_signal_blockers_marks_pullback_window_as_movement_blocker(self) -> None:
+        config = make_config(strategy_mode="trend_pullback")
+        snapshot = MarketSnapshot(
+            symbol="BTCUSDT",
+            close=Decimal("110"),
+            pct_change=1.6,
+            rsi=55.0,
+            ema_fast=109.0,
+            ema_slow=108.0,
+            volume_ratio=2.0,
+        )
+
+        signal = build_open_signal(snapshot, config)
+        self.assertIsNone(signal)
+        self.assertIn("движение", signal_blockers(snapshot, config, LONG))
+
     def test_build_risk_exit_signal_detects_take_profit_short(self) -> None:
         config = make_config(stop_loss_pct=1.5, take_profit_pct=2.5)
         position = Position(

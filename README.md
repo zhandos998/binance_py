@@ -211,6 +211,7 @@ Remove-Item Env:BOT_PROFILE_FILE
 LIVE_TRADING=true
 FUTURES_DEMO=true
 FUTURES_BASE_URL=https://demo-fapi.binance.com/fapi
+FUTURES_QUOTE_ASSET=USDT
 USE_TEST_ORDER=false
 ```
 
@@ -309,6 +310,23 @@ py -m unittest discover -s tests -v
 ```powershell
 pip install -r requirements-dev.txt
 pytest -q
+```
+
+## Strategy Modes
+
+- `STRATEGY_MODE=momentum` — текущая базовая стратегия импульса; поведение совместимо с прежней версией.
+- `STRATEGY_MODE=trend_pullback` — отдельный более рискованный режим: бот ищет вход не на продолжении импульса, а на откате внутри уже подтвержденного тренда по `EMA` и `HTF`.
+- Для pullback-режима сохраняются фильтры `funding`, `higher timeframe`, `stop-loss` и общие risk-лимиты, поэтому стратегия рискованнее по входу, но не отключает защитный контур.
+
+## Risky Profile
+
+- Добавлен отдельный профиль [.env.risky](d:/zhandos998/Desktop/binance_py/.env.risky) для запуска новой стратегии отдельно от `.env.work`.
+- Профиль использует `STRATEGY_MODE=trend_pullback`, отдельные `SQLite/log/positions` файлы и не затрагивает рабочий demo-профиль.
+- Запуск:
+
+```powershell
+$env:BOT_PROFILE_FILE=".env.risky"
+py bot.py
 ```
 
 ## CI
